@@ -14,7 +14,7 @@ class MyStrategy(PlacementStrategy):
 
     # ── Tunable hyperparameters ───────────────────────────────
     N_BUCKETS             = 6
-    MAX_STACK_HEIGHT      = 4      # Leave 1 tier of buffer (max is 5)
+    MAX_STACK_HEIGHT      = 5      # Leave 1 tier of buffer (max is 5)
     MAX_BLOCK_OCCUPANCY   = 0.88   # Stop preferring a block beyond this
     TRUCK_UNCERT_MULT     = 1.2    # ERC multiplier for TRUCK_RECV events
     NEIGHBORHOOD_PENALTY  = 0.4    # Adjacent stack height diff penalty

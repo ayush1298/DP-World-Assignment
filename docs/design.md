@@ -106,18 +106,30 @@ The table below compares the performance of our hybrid strategy against the two 
 
 | Dataset | Metric | Random Baseline | Greedy Baseline | **Our Hybrid Strategy** |
 | :--- | :--- | :--- | :--- | :--- |
-| **Train** | Total Reshuffles | 8,933 | 8,036 | **3,757** |
-| | Reshuffles/Retrieval | 0.8752 | 0.7873 | **0.3681** |
-| | Score — Reshuffles | 0.0 / 30.0 | 0.5 / 30.0 | **18.5 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **10.5 / 40.0** | **28.5 / 40.0** |
-| **Test** | Total Reshuffles | 9,122* | 7,288* | **3,878** |
-| | Reshuffles/Retrieval | 0.8883* | 0.7100* | **0.4020** |
-| | Score — Reshuffles | 0.0 / 30.0 | 3.9 / 30.0 | **17.1 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **13.9 / 40.0** | **27.1 / 40.0** |
+| **Train** | Total Reshuffles | 8,933 | 8,036 | **3,073** |
+| | Reshuffles/Retrieval | 0.8752 | 0.7873 | **0.3011** |
+| | Score — Reshuffles | 0.0 / 30.0 | 0.5 / 30.0 | **21.4 / 30.0** |
+| | **Quantitative Total** | **10.0 / 40.0** | **10.5 / 40.0** | **31.4 / 40.0** |
+| **Test** | Total Reshuffles | 9,122* | 7,288* | **2,770** |
+| | Reshuffles/Retrieval | 0.8883* | 0.7100* | **0.2871** |
+| | Score — Reshuffles | 0.0 / 30.0 | 3.9 / 30.0 | **22.0 / 30.0** |
+| | **Quantitative Total** | **10.0 / 40.0** | **13.9 / 40.0** | **32.0 / 40.0** |
 
 *\*Note: Baseline scores on the test set are referenced from `src/scoring.py`.*
 
-Our hybrid strategy achieved a **~50% reduction in reshuffles** compared to the greedy baseline on both datasets, yielding a quantitative score of **27.1 / 40.0** on the test dataset.
+Our hybrid strategy achieved a **~60% reduction in reshuffles** compared to the greedy baseline on both datasets, yielding a quantitative score of **32.0 / 40.0** on the test dataset.
+
+### 5.2 Quick Validation Test (First 500 Events of Train Set)
+
+The table below shows the results of running the quick validation test (`bash validate_submission.sh`) across all strategies:
+
+| Strategy | Total Reshuffles | Reshuffles/Retrieval | Score — Reshuffles | Quantitative Total |
+| :--- | :--- | :--- | :--- | :--- |
+| **Random Baseline** | 52 | 1.0833 | 0.0 / 30.0 | 10.0 / 40.0 |
+| **Greedy Baseline** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
+| **Our Hybrid Strategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
+
+*Note: All strategies score 10.0 on this truncated subset because the yard starts with disorganized initial containers. The few retrievals that occur in the first 500 events are of pre-existing buried containers, meaning these early reshuffles are unavoidable.*
 
 ---
 
