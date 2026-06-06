@@ -92,9 +92,8 @@ if [ -d "solution" ]; then
     # Look for a class that extends PlacementStrategy
     STRATEGY_FILE=$(grep -rl "PlacementStrategy" solution/ 2>/dev/null | head -1)
     if [ -n "$STRATEGY_FILE" ]; then
-        # Extract module path and class name
         MODULE=$(echo "$STRATEGY_FILE" | sed 's/\.py$//' | tr '/' '.')
-        CLASS=$(grep -oP 'class\s+(\w+)\s*\(.*PlacementStrategy' "$STRATEGY_FILE" | head -1 | grep -oP 'class\s+\K\w+')
+        CLASS=$(python -c "import re; m = re.search(r'class\s+(\w+)\s*\(.*PlacementStrategy', open('$STRATEGY_FILE').read()); print(m.group(1) if m else '')")
         if [ -n "$CLASS" ]; then
             STRATEGY="${MODULE}.${CLASS}"
             echo "  Found strategy: $STRATEGY"
