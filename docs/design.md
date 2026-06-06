@@ -56,11 +56,12 @@ This counts how many existing containers in the stack depart *earlier* than the 
 ### 3.3 Stack Scoring Function
 
 Each candidate stack in the target block is scored using a multi-attribute weighted function (lower score is better):
-$$\text{Score} = \alpha \cdot \text{ERC}_{\text{eff}} + \beta \cdot \text{Height Penalty} + \gamma \cdot \text{Neighborhood Penalty} + \zeta \cdot \text{Block Penalty} - \delta \cdot \text{Cohesion Bonus}$$
+$$\text{Score} = \alpha \cdot \text{ERC}_{\text{eff}} + \beta \cdot \text{Height Penalty} + \gamma \cdot \text{Neighborhood Penalty} + \zeta \cdot \text{Block Penalty} + \text{Vessel Mixing Penalty} - \delta \cdot \text{Cohesion Bonus}$$
 Where:
 - $\text{ERC}_{\text{eff}} = \text{ERC} \times 1.2$ for `TRUCK_RECV` and $\text{ERC} \times 1.0$ for `DISCHARGE`.
-- **Height Penalty**: $\text{height}^2 \times 0.15 \times \text{occupancy}$. Penalizes tall stacks to keep stack heights balanced, preserving relocation capacity.
+- **Height Penalty**: $\text{height}^2 \times 0.15$. Penalizes tall stacks to keep stack heights balanced, preserving relocation capacity (independent of yard occupancy to prevent stacks growing tall early when sparse - Fix 6A).
 - **Neighborhood Penalty**: Penalizes stacks that are adjacent to much taller stacks ($&gt;1$ tier height difference) to prevent building "walls" that block crane access.
+- **Vessel Mixing Penalty**: $+15.0$ if the stack is non-empty and contains any container belonging to a different vessel, to strongly enforce homogeneous vessel stacks (Fix 6B).
 - **Cohesion Bonus**: $+2.0$ for same vessel, $+1.5$ for same port, and $+0.5$ per adjacent same-vessel container. Groups same-destination cargo.
 - **Adaptive Block Penalty**: Penalizes blocks experiencing high historical reshuffle rates.
 - **Dynamic Weights**: $\alpha$ (ERC weight) increases from 10 to 15, and $\delta$ (cohesion bonus) decreases from 3.0 to 1.5 when yard occupancy exceeds 80%.
@@ -106,18 +107,18 @@ The table below compares the performance of our hybrid strategy against the two 
 
 | Dataset | Metric | Random Baseline | Greedy Baseline | **Our Hybrid Strategy** |
 | :--- | :--- | :--- | :--- | :--- |
-| **Train** | Total Reshuffles | 8,933 | 8,036 | **3,073** |
-| | Reshuffles/Retrieval | 0.8752 | 0.7873 | **0.3011** |
-| | Score — Reshuffles | 0.0 / 30.0 | 0.5 / 30.0 | **21.4 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **10.5 / 40.0** | **31.4 / 40.0** |
-| **Test** | Total Reshuffles | 9,122* | 7,288* | **2,770** |
-| | Reshuffles/Retrieval | 0.8883* | 0.7100* | **0.2871** |
-| | Score — Reshuffles | 0.0 / 30.0 | 3.9 / 30.0 | **22.0 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **13.9 / 40.0** | **32.0 / 40.0** |
+| **Train** | Total Reshuffles | 8,933 | 8,036 | **3,040** |
+| | Reshuffles/Retrieval | 0.8752 | 0.7873 | **0.2978** |
+| | Score — Reshuffles | 0.0 / 30.0 | 0.5 / 30.0 | **21.5 / 30.0** |
+| | **Quantitative Total** | **10.0 / 40.0** | **10.5 / 40.0** | **31.5 / 40.0** |
+| **Test** | Total Reshuffles | 9,122* | 7,288* | **2,752** |
+| | Reshuffles/Retrieval | 0.8883* | 0.7100* | **0.2853** |
+| | Score — Reshuffles | 0.0 / 30.0 | 3.9 / 30.0 | **22.1 / 30.0** |
+| | **Quantitative Total** | **10.0 / 40.0** | **13.9 / 40.0** | **32.1 / 40.0** |
 
 *\*Note: Baseline scores on the test set are referenced from `src/scoring.py`.*
 
-Our hybrid strategy achieved a **~60% reduction in reshuffles** compared to the greedy baseline on both datasets, yielding a quantitative score of **32.0 / 40.0** on the test dataset.
+Our hybrid strategy achieved a **~60% reduction in reshuffles** compared to the greedy baseline on both datasets, yielding a quantitative score of **32.1 / 40.0** on the test dataset.
 
 ### 5.2 Quick Validation Test (First 500 Events of Train Set)
 

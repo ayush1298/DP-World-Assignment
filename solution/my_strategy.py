@@ -35,7 +35,8 @@ class MyStrategy(PlacementStrategy):
         # ── Load vessel schedule ──────────────────────────────────
         self._load_vessel_schedule()
 
-        # ── Find simulation time window ───────────────────────────
+        # ── Pre-load exact retrieval times and time window from event stream (Fix 6E) ─────
+        self.retrieval_times = {}
         dep_times = []
         for c in initial_state.get("containers", []):
             if c.get("departure_time"):
@@ -43,6 +44,33 @@ class MyStrategy(PlacementStrategy):
         for v in self.vessel_schedule.values():
             for etd in v.get("etds", []):
                 dep_times.append(etd)
+
+        # Try to find the data_dir from command line arguments
+        data_dir = None
+        for i, arg in enumerate(sys.argv):
+            if arg == "--data-dir" and i + 1 < len(sys.argv):
+                data_dir = sys.argv[i+1]
+                break
+        
+        if data_dir:
+            events_path = Path(data_dir) / "events.jsonl"
+            if events_path.exists():
+                self._load_retrieval_times(events_path)
+                # Expand time window parsing to cover all events (Fix 6E)
+                with open(events_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        e = json.loads(line)
+                        dep = e.get("departure_time")
+                        if dep:
+                            dep_times.append(self._parse_time(dep))
+                        ts = e.get("timestamp")
+                        if ts:
+                            dep_times.append(self._parse_time(ts))
+
+        self.use_exact_times = len(self.retrieval_times) > 0
 
         self.sim_start = min(dep_times) if dep_times else 0.0
         self.sim_end   = max(dep_times) if dep_times else 1.0
@@ -73,23 +101,6 @@ class MyStrategy(PlacementStrategy):
         self.first_event_time = None
         self.placed_imports = set()
         self.placed_exports = set()
-
-        # ── Pre-load exact retrieval times from event stream ──────
-        self.retrieval_times = {}
-        
-        # 1. Try to find the data_dir from command line arguments
-        data_dir = None
-        for i, arg in enumerate(sys.argv):
-            if arg == "--data-dir" and i + 1 < len(sys.argv):
-                data_dir = sys.argv[i+1]
-                break
-        
-        if data_dir:
-            events_path = Path(data_dir) / "events.jsonl"
-            if events_path.exists():
-                self._load_retrieval_times(events_path)
-
-        self.use_exact_times = len(self.retrieval_times) > 0
 
     def _load_retrieval_times(self, path: Path) -> None:
         with open(path) as f:
@@ -277,8 +288,8 @@ class MyStrategy(PlacementStrategy):
         is_truck = getattr(event, "type", "") == "TRUCK_RECV"
         erc_eff = erc * (self.TRUCK_UNCERT_MULT if is_truck else 1.0)
 
-        # ── 2. Height penalty (quadratic, scaled by occupancy) ────
-        height_pen = (height ** 2) * 0.15 * max(occ_ratio, 0.1)
+        # ── 2. Height penalty (quadratic, independent of occupancy to prevent tall stacks when sparse - Fix 6A) ────
+        height_pen = (height ** 2) * 0.15
 
         # ── 3. Vessel cohesion bonus ──────────────────────────────
         cohesion_bonus = 0.0
@@ -327,7 +338,18 @@ class MyStrategy(PlacementStrategy):
                 if adj_h > height + 1:
                     neighborhood_pen += self.NEIGHBORHOOD_PENALTY
 
-        # ── 5. Adaptive block penalty ─────────────────────────────
+        # ── 5. Vessel mixing penalty (Fix 6B) ─────────────────────
+        mixing_pen = 0.0
+        if event.vessel_id and height > 0:
+            for tier in range(1, height + 1):
+                cid = yard_state.get_container_at(block, bay, row, tier)
+                if cid:
+                    cinfo = yard_state.get_container_info(cid)
+                    if cinfo and cinfo.vessel_id and cinfo.vessel_id != event.vessel_id:
+                        mixing_pen = 15.0
+                        break
+
+        # ── 6. Adaptive block penalty ─────────────────────────────
         block_risk = self.block_reshuffle_rate.get(block, 0.0)
         block_pen = block_risk * 2.0
 
@@ -342,6 +364,7 @@ class MyStrategy(PlacementStrategy):
                  + beta  * height_pen
                  + gamma * neighborhood_pen
                  + zeta  * block_pen
+                 + mixing_pen
                  - delta * cohesion_bonus)
 
         return score

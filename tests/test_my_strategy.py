@@ -98,3 +98,56 @@ def test_fallback_always_returns_valid(empty_yard):
                 
     pos = strategy._fallback_greedy(empty_yard)
     assert pos is not None
+
+
+def test_vessel_mixing_penalty(empty_yard):
+    strategy = MyStrategy()
+    strategy.initialize(
+        {"blocks": {"B01": {"bays": 5, "rows": 5, "tiers": 5}}},
+        {"containers": []}
+    )
+    
+    # Place a container of Vessel V1 in B01, bay 1, row 1
+    c1 = _make_container(cid="C1", vessel="V1", dep_time="2025-01-15T12:00:00")
+    empty_yard.place_container(c1, Position("B01", 1, 1, 1))
+    
+    # Place a container of Vessel V2 in B01, bay 2, row 2
+    c2 = _make_container(cid="C2", vessel="V2", dep_time="2025-01-15T12:00:00")
+    empty_yard.place_container(c2, Position("B01", 2, 2, 1))
+
+    # Event for incoming container of Vessel V1
+    event_v1 = _make_container(cid="C3", vessel="V1", dep_time="2025-01-10T12:00:00")
+    new_lrk = strategy._get_lrk_from_event(event_v1)
+
+    # Score for stacking V1 on top of V1 (homogeneous stack)
+    score_homo = strategy._score_stack(empty_yard, "B01", 1, 1, event_v1, new_lrk, 0.1)
+    
+    # Score for stacking V1 on top of V2 (mixed stack)
+    score_mixed = strategy._score_stack(empty_yard, "B01", 2, 2, event_v1, new_lrk, 0.1)
+
+    # Mixed stack should have a much higher score due to vessel mixing penalty
+    assert score_mixed - score_homo > 10.0
+
+
+def test_height_penalty_independent_of_occupancy(empty_yard):
+    strategy = MyStrategy()
+    strategy.initialize(
+        {"blocks": {"B01": {"bays": 5, "rows": 5, "tiers": 5}}},
+        {"containers": []}
+    )
+    
+    # Place containers on B01, bay 1, row 1 to reach height 2
+    c1 = _make_container(cid="C1", vessel="V1", dep_time="2025-01-20T12:00:00")
+    c2 = _make_container(cid="C2", vessel="V1", dep_time="2025-01-15T12:00:00")
+    empty_yard.place_container(c1, Position("B01", 1, 1, 1))
+    empty_yard.place_container(c2, Position("B01", 1, 1, 2))
+
+    event = _make_container(cid="C3", vessel="V1", dep_time="2025-01-10T12:00:00")
+    new_lrk = strategy._get_lrk_from_event(event)
+
+    # Score with low yard occupancy vs high yard occupancy (both below 0.8 threshold)
+    score_low_occ = strategy._score_stack(empty_yard, "B01", 1, 1, event, new_lrk, 0.05)
+    score_high_occ = strategy._score_stack(empty_yard, "B01", 1, 1, event, new_lrk, 0.75)
+
+    # The scores should be identical because height penalty is independent of occupancy ratio.
+    assert score_low_occ == score_high_occ
