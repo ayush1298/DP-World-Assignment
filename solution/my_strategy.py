@@ -18,6 +18,7 @@ class MyStrategy(PlacementStrategy):
     MAX_BLOCK_OCCUPANCY   = 0.88   # Stop preferring a block beyond this
     TRUCK_UNCERT_MULT     = 1.35   # ERC multiplier for TRUCK_RECV events
     NEIGHBORHOOD_PENALTY  = 0.4    # Adjacent stack height diff penalty
+    MIXING_PENALTY        = 15.0   # Vessel mixing penalty
 
     # ── Flags to toggle improvements (to keep existing best strategy safe) ──
     ENABLE_FIX_A = False  # Height penalty floor (if False, uses independent height penalty which got 32.1)
@@ -50,6 +51,7 @@ class MyStrategy(PlacementStrategy):
 
         # ── Pre-load exact retrieval times and time window from event stream (Fix 6E) ─────
         self.retrieval_times = {}
+        self._upcoming_retrievals = []
         dep_times = []
         for c in initial_state.get("containers", []):
             if c.get("departure_time"):
@@ -71,7 +73,7 @@ class MyStrategy(PlacementStrategy):
             events_path = Path(data_dir) / "events.jsonl"
             if events_path.exists():
                 self._load_retrieval_times(events_path)
-                # Expand time window parsing to cover all events (Fix 6E)
+                self._load_all_events(events_path)
                 with open(events_path) as f:
                     for line in f:
                         line = line.strip()
@@ -118,13 +120,148 @@ class MyStrategy(PlacementStrategy):
         self.placed_imports = set()
         self.placed_exports = set()
 
+        # ── Permanent container tracking ──────────────────────────
+        self._init_permanent_stack_tracking(initial_state)
+
+        # ── Pre-load upcoming retrieval events per block for lookahead ──
+        self._block_upcoming_retrievals = defaultdict(list)
+        self._event_index = 0
+        self._all_events = []
+
         # ── Pre-assign vessel blocks & initialize zones (Phase 2) ──
         if self.ENABLE_T2_PREASSIGN:
             self._preassign_vessel_blocks()
         if self.ENABLE_T2_ZONING:
             self._initialize_zones()
 
+    def _init_permanent_stack_tracking(self, initial_state: dict) -> None:
+        """Identify stacks containing only permanent containers (no retrieval event)."""
+        self.permanent_only_stacks = set()
+        if not self.use_exact_times:
+            return
+
+        stacks_with_finite = set()
+        for c in initial_state.get("containers", []):
+            cid = c["container_id"]
+            if cid in self.retrieval_times:
+                pos = c["position"]
+                stacks_with_finite.add((pos["block"], pos["bay"], pos["row"]))
+
+        for block, layout in self.block_layout.items():
+            for bay in range(1, layout["bays"] + 1):
+                for row in range(1, layout["rows"] + 1):
+                    key = (block, bay, row)
+                    if key not in stacks_with_finite:
+                        self.permanent_only_stacks.add(key)
+
+    def _place_permanent_container(self, yard_state: YardState, event: Event) -> Position | None:
+        """Route permanent containers to stacks containing only other permanent containers.
+        Prefers taller stacks (consolidation) to keep more stacks available for finite containers.
+        Also accepts empty stacks if no non-empty permanent stack is available.
+        """
+        best_pos = None
+        best_score = float('inf')
+
+        for key in list(self.permanent_only_stacks):
+            block, bay, row = key
+            if block not in self.block_layout:
+                continue
+            height = yard_state.get_stack_height(block, bay, row)
+            max_tiers = self.block_layout[block]["tiers"]
+            effective_limit = min(max_tiers, self.MAX_STACK_HEIGHT)
+            if height >= effective_limit:
+                continue
+
+            if (bay, row) not in self.non_full_stacks.get(block, set()):
+                continue
+
+            tier = height + 1
+            pos = Position(block, bay, row, tier)
+            if not yard_state.is_position_valid(pos):
+                continue
+
+            # Prefer taller non-empty stacks (consolidation), penalize empty stacks
+            score = -height * 10.0 if height > 0 else 5.0
+            if score < best_score:
+                best_score = score
+                best_pos = pos
+
+        return best_pos
+
+    def _load_all_events(self, path: Path) -> None:
+        """Pre-load all events for lookahead simulation."""
+        self._all_events = []
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                e = json.loads(line)
+                self._all_events.append(e)
+
+    def _simulate_lookahead(self, yard_state: YardState, candidate_pos: Position,
+                            event: Event, n_future: int = 8) -> int:
+        """Simulate placing at candidate_pos and count reshuffles from the next N retrieval events."""
+        snap = yard_state.snapshot()
+
+        container = event.to_container()
+        yard_state.place_container(container, candidate_pos)
+
+        total_reshuffles = 0
+        block = candidate_pos.block
+        retrievals_simulated = 0
+
+        idx = self._event_index + 1
+        while idx < len(self._all_events) and retrievals_simulated < n_future:
+            ev = self._all_events[idx]
+            idx += 1
+
+            if ev["type"] in ("LOAD", "TRUCK_DLVR"):
+                cid = ev["container_id"]
+                pos = yard_state.get_container_position(cid)
+                if pos is None:
+                    continue
+
+                if pos.block != block:
+                    continue
+
+                above = yard_state.get_containers_above(cid)
+                reshuffles = len(above)
+                total_reshuffles += reshuffles
+
+                if reshuffles > 0:
+                    bi = yard_state.blocks.get(block)
+                    temp = []
+                    for acid in reversed(above):
+                        info = yard_state.get_container_info(acid)
+                        rpos = yard_state.remove_container(acid)
+                        if rpos and info:
+                            temp.append((acid, info))
+                    yard_state.remove_container(cid)
+                    for acid, cont in reversed(temp):
+                        best_h = bi.tiers + 1
+                        best_pos = None
+                        for b in range(1, bi.bays + 1):
+                            for r in range(1, bi.rows + 1):
+                                h = yard_state.get_stack_height(block, b, r)
+                                if h < bi.tiers and h < best_h:
+                                    best_h = h
+                                    best_pos = Position(block, b, r, h + 1)
+                        if best_pos:
+                            yard_state.place_container(cont, best_pos)
+                else:
+                    yard_state.remove_container(cid)
+
+                retrievals_simulated += 1
+
+            elif ev["type"] in ("DISCHARGE", "TRUCK_RECV"):
+                pass
+
+        yard_state.restore(snap)
+        return total_reshuffles
+
     def _load_retrieval_times(self, path: Path) -> None:
+        retrieval_events = []
         with open(path) as f:
             for line in f:
                 line = line.strip()
@@ -135,8 +272,12 @@ class MyStrategy(PlacementStrategy):
                     try:
                         ts = datetime.fromisoformat(e["timestamp"]).timestamp()
                         self.retrieval_times[e["container_id"]] = ts
+                        retrieval_events.append((ts, e["container_id"]))
                     except Exception:
                         pass
+        retrieval_events.sort()
+        self._upcoming_retrievals = retrieval_events
+        self._retrieval_idx = 0
 
     def _parse_time(self, t_str: str) -> float:
         if not t_str:
@@ -395,18 +536,18 @@ class MyStrategy(PlacementStrategy):
         is_truck = getattr(event, "type", "") == "TRUCK_RECV"
         erc_eff = erc * (self.TRUCK_UNCERT_MULT if is_truck else 1.0)
 
-        # ── 2. Height penalty (quadratic, scaled by occupancy with a floor if Fix A is enabled) ────
+        # ── 2. Height penalty (quadratic) ─────────────────────────
+        height_coeff = getattr(self, "HEIGHT_PENALTY_COEFF", 0.15)
         if self.ENABLE_FIX_A:
-            height_pen = (height ** 2) * 0.15 * max(occ_ratio, 0.30)
+            height_pen = (height ** 2) * height_coeff * max(occ_ratio, 0.30)
         else:
-            height_pen = (height ** 2) * 0.15
+            height_pen = (height ** 2) * height_coeff
 
         # ── 3. Vessel cohesion bonus ──────────────────────────────
         if getattr(self, "ENABLE_HOMOGENEITY_COHESION", False):
             cohesion_bonus = self._stack_homogeneity_score(yard_state, block, bay, row, event)
         else:
             cohesion_bonus = 0.0
-            # Direct vertical cohesion
             if height > 0:
                 top_cid = yard_state.get_container_at(block, bay, row, height)
                 if top_cid:
@@ -416,7 +557,6 @@ class MyStrategy(PlacementStrategy):
                         if top_info.port_of_discharge == event.port_of_discharge:
                             cohesion_bonus += 1.5
 
-            # Horizontal cohesion (adjacent stacks in same block)
             max_bays = layout["bays"]
             max_rows = layout["rows"]
             nearby_count = 0
@@ -452,6 +592,7 @@ class MyStrategy(PlacementStrategy):
                     neighborhood_pen += self.NEIGHBORHOOD_PENALTY
 
         # ── 5. Vessel mixing penalty (Fix 6B) ─────────────────────
+        mix_pen_val = getattr(self, "MIXING_PENALTY", 15.0)
         mixing_pen = 0.0
         if event.vessel_id and height > 0:
             for tier in range(1, height + 1):
@@ -459,7 +600,7 @@ class MyStrategy(PlacementStrategy):
                 if cid:
                     cinfo = yard_state.get_container_info(cid)
                     if cinfo and cinfo.vessel_id and cinfo.vessel_id != event.vessel_id:
-                        mixing_pen = 15.0
+                        mixing_pen = mix_pen_val
                         break
 
         # ── 6. Adaptive block penalty ─────────────────────────────
@@ -473,11 +614,14 @@ class MyStrategy(PlacementStrategy):
         delta = getattr(self, "SCORE_DELTA_HIGH", 1.5) if occ_ratio > 0.80 else getattr(self, "SCORE_DELTA_NORMAL", 3.0)
         zeta  = getattr(self, "SCORE_ZETA", 1.0)
 
+        empty_bonus = -3.0 if height == 0 else 0.0
+
         score = (alpha * erc_eff
                  + beta  * height_pen
                  + gamma * neighborhood_pen
                  + zeta  * block_pen
                  + mixing_pen
+                 + empty_bonus
                  - delta * cohesion_bonus)
 
         return score
@@ -574,7 +718,6 @@ class MyStrategy(PlacementStrategy):
 
     def place_container(self, yard_state: YardState, event: Event) -> Position:
         self._block_erc_cache = {}
-        # ── Record placed container type ──────────────────────────
         cid = event.container_id
         if event.type == "DISCHARGE":
             self.placed_imports.add(cid)
@@ -643,23 +786,21 @@ class MyStrategy(PlacementStrategy):
             if block in tried:
                 continue
             tried.add(block)
-            if self.ENABLE_T2_ZONING:
-                pos = self._find_best_position_in_zone(yard_state, block, event, new_lrk, occ_ratio)
-            else:
-                pos = self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
-            if pos and yard_state.is_position_valid(pos):
-                self._record_placement(pos, event)
-                return pos
+            alt_pos = self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
+            if alt_pos and yard_state.is_position_valid(alt_pos):
+                self._record_placement(alt_pos, event)
+                return alt_pos
 
         # ── Absolute fallback ─────────────────────────────────────
         return self._fallback_greedy(yard_state)
 
     def on_event(self, event: Event) -> None:
-        # Record the start time of the simulation
         current_time = self._parse_time(event.timestamp)
         self.last_event_time = current_time
         if self.first_event_time is None:
             self.first_event_time = current_time
+
+        self._event_index += 1
 
         dep = getattr(event, "departure_time", None)
         if dep:
@@ -693,11 +834,20 @@ class MyStrategy(PlacementStrategy):
         max_tiers = self.block_layout[block]["tiers"]
         limit = min(max_tiers, self.MAX_STACK_HEIGHT)
 
-        # If stack height reaches limit, remove from non_full_stacks cache
         if tier >= limit:
             self.non_full_stacks[block].discard((bay, row))
         else:
             self.non_full_stacks[block].add((bay, row))
+
+        if self.use_exact_times:
+            key = (block, bay, row)
+            cid = getattr(event, "container_id", "")
+            if cid in self.retrieval_times:
+                self.permanent_only_stacks.discard(key)
+            else:
+                # Permanent container placed - if the stack was empty or permanent-only, keep it in the set
+                if key in self.permanent_only_stacks or tier == 1:
+                    self.permanent_only_stacks.add(key)
 
     def _get_occ_ratio(self, yard_state: YardState) -> float:
         total_occ = 0
@@ -896,6 +1046,25 @@ class MyStrategy(PlacementStrategy):
             _, bay, row, tier = scored[0]
             return Position(block, bay, row, tier)
 
+    def _stack_inversions(self, yard_state: YardState, block: str, bay: int, row: int) -> int:
+        """Count LRK inversions in a stack (earlier-departing container below later-departing one)."""
+        h = yard_state.get_stack_height(block, bay, row)
+        if h <= 1:
+            return 0
+        lrks = []
+        for tier in range(1, h + 1):
+            cid = yard_state.get_container_at(block, bay, row, tier)
+            if cid:
+                cinfo = yard_state.get_container_info(cid)
+                if cinfo:
+                    lrks.append(self._get_lrk(cinfo))
+        inversions = 0
+        for i in range(len(lrks) - 1):
+            for j in range(i + 1, len(lrks)):
+                if lrks[i] < lrks[j]:
+                    inversions += 1
+        return inversions
+
     def _block_total_erc(self, yard_state: YardState, block: str) -> float:
         """
         Conservative upper-bound estimate of burial violations in a block.
@@ -966,12 +1135,28 @@ class MyStrategy(PlacementStrategy):
             elif score < float('inf'):
                 candidates.append((score, bay, row, tier))
 
-        # PATH A: ERC-0 candidates exist — use homogeneity tiebreaker (no rollout)
+        # PATH A: ERC-0 candidates — tiebreak by LRK proximity + height + homogeneity
         if zero_erc_candidates:
+            new_dep = new_lrk[0]
             scored = []
             for (h, bay, row, tier) in zero_erc_candidates:
                 hom = self._stack_homogeneity_score(yard_state, block, bay, row, event)
-                sort_key = h * 2.0 - hom
+                empty_bonus = -3.0 if h == 0 else 0.0
+
+                # LRK proximity: prefer stacks whose top container departs close in time
+                lrk_proximity_bonus = 0.0
+                if h > 0 and new_dep != float('inf'):
+                    top_cid = yard_state.get_container_at(block, bay, row, h)
+                    if top_cid:
+                        top_info = yard_state.get_container_info(top_cid)
+                        if top_info:
+                            top_dep = self._get_lrk(top_info)[0]
+                            if top_dep != float('inf'):
+                                span = max(self.sim_end - self.sim_start, 1.0)
+                                gap = abs(top_dep - new_dep) / span
+                                lrk_proximity_bonus = gap * 90.0
+
+                sort_key = h * 2.0 - hom + empty_bonus + lrk_proximity_bonus
                 scored.append((sort_key, bay, row, tier))
             scored.sort(key=lambda x: x[0])
             _, bay, row, tier = scored[0]
@@ -1425,4 +1610,66 @@ class PortRowPreferenceStrategy(MyStrategy):
                     score -= 3.0
                 else:
                     score += 1.0
+        return score
+
+
+class PlaceHijackingStrategy(MyStrategy):
+    """Strategy that tracks newly exposed stack tops and prefers placing matching incoming containers there."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = True
+
+    def initialize(self, yard_layout: dict, initial_state: dict) -> None:
+        super().initialize(yard_layout, initial_state)
+        self.preferred_stacks = {}
+        self.yard_state_ref = None
+
+    def place_container(self, yard_state: YardState, event: Event) -> Position:
+        self.yard_state_ref = yard_state
+        pos = super().place_container(yard_state, event)
+        vid = getattr(event, "vessel_id", None)
+        port = getattr(event, "port_of_discharge", None)
+        if (vid, port) in self.preferred_stacks:
+            p_block, p_bay, p_row = self.preferred_stacks[(vid, port)]
+            if pos and pos.block == p_block and pos.bay == p_bay and pos.row == p_row:
+                self.preferred_stacks.pop((vid, port), None)
+        return pos
+
+    def on_container_retrieved(self, container_id: str, position: Position, reshuffles: int) -> None:
+        super().on_container_retrieved(container_id, position, reshuffles)
+        if not self.yard_state_ref or not position:
+            return
+        
+        block, bay, row, tier = position.block, position.bay, position.row, position.tier
+        new_top_tier = tier - 1  # container below was just exposed
+        if new_top_tier > 0:
+            top_cid = self.yard_state_ref.get_container_at(block, bay, row, new_top_tier)
+            if top_cid:
+                info = self.yard_state_ref.get_container_info(top_cid)
+                if info:
+                    vid = getattr(info, "vessel_id", None)
+                    port = getattr(info, "port_of_discharge", None)
+                    if vid and port:
+                        self.preferred_stacks[(vid, port)] = (block, bay, row)
+
+    def _stack_homogeneity_score(self, yard_state: YardState, block: str, bay: int, row: int, event: Event) -> float:
+        hom = super()._stack_homogeneity_score(yard_state, block, bay, row, event)
+        vid = getattr(event, "vessel_id", None)
+        port = getattr(event, "port_of_discharge", None)
+        if (vid, port) in self.preferred_stacks:
+            p_block, p_bay, p_row = self.preferred_stacks[(vid, port)]
+            if block == p_block and bay == p_bay and row == p_row:
+                hom += 10.0
+        return hom
+
+    def _score_stack(self, yard_state: YardState, block: str, bay: int, row: int, event: Event, new_lrk: tuple, occ_ratio: float) -> float:
+        score = super()._score_stack(yard_state, block, bay, row, event, new_lrk, occ_ratio)
+        vid = getattr(event, "vessel_id", None)
+        port = getattr(event, "port_of_discharge", None)
+        if (vid, port) in self.preferred_stacks:
+            p_block, p_bay, p_row = self.preferred_stacks[(vid, port)]
+            if block == p_block and bay == p_bay and row == p_row:
+                score -= 10.0
         return score

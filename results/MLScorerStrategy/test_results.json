@@ -1,0 +1,20 @@
+{
+  "total_events": 19508,
+  "placement_events": 9861,
+  "retrieval_events": 9647,
+  "total_reshuffles": 4546,
+  "reshuffles_per_retrieval": 0.4712,
+  "reshuffle_percentage": 26.14,
+  "max_reshuffles_single": 4,
+  "retrievals_with_reshuffles": 2522,
+  "hard_constraint_violations": 0,
+  "placement_failures": 0,
+  "errors": 0,
+  "final_yard_count": 5985,
+  "elapsed_sec": 2691.05,
+  "score_reshuffles": 14.1,
+  "score_violations": 10.0,
+  "quantitative_score": 24.1,
+  "strategy": "solution.my_strategy.MLScorerStrategy",
+  "data_dir": "data/test"
+}

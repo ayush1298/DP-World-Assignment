@@ -219,7 +219,14 @@ This section documents the chronological progression of ideas implemented from t
   - **Test Reshuffles**: 2,693 (Score: 22.3/30, Quantitative Total: 32.3/40)
   - *Observation*: Slightly worse than rollout. Row-level partitioning restricts flexibility and leads to overflow across rows during high-density port arrivals, confirming that soft zoning preferences still introduce minor coordination inefficiencies.
 
-### 7.9 Advanced Strategies Summary Table
+### 7.9 PlaceHijackingStrategy
+- **Description**: Tracks newly exposed stack tops during container retrieval events. It queues a consolidation preference: the next time a container for the matching `(vessel, port)` arrives, it is directed to place on that exposed stack, virtually simulating re-marshalling.
+- **Results**:
+  - **Train Reshuffles**: 2,841 (Score: 22.4/30, Quantitative Total: 32.4/40)
+  - **Test Reshuffles**: 2,686 (Score: 22.4/30, Quantitative Total: 32.4/40)
+  - *Observation*: Improves upon baseline vessel pre-assignment but slightly underperforms analytical rollout. Consolidating stack tops after retrievals is highly effective for stack purity, but occasionally limits flexibility when the targeted stack is not structurally ideal.
+
+### 7.10 Advanced Strategies Summary Table
 
 The table below summarizes the quantitative scores of all the newly implemented advanced strategies:
 
@@ -227,6 +234,7 @@ The table below summarizes the quantitative scores of all the newly implemented 
 | :--- | :--- | :--- | :--- | :--- |
 | **AnalyticalRolloutStrategy** (Best) | **2,763** | **32.7 / 40.0** | **2,644** | **32.5 / 40.0** |
 | **BurialDepthPenaltyStrategy** | 2,765 | 32.7 / 40.0 | 2,666 | 32.4 / 40.0 |
+| **PlaceHijackingStrategy** | 2,841 | 32.4 / 40.0 | 2,686 | 32.4 / 40.0 |
 | **FutureReservationStrategy** | 2,873 | 32.2 / 40.0 | 2,658 | 32.5 / 40.0 |
-| **MLScorerStrategy** | 3,021 | 31.6 / 40.0 | 2,718 | 32.2 / 40.0 |
 | **PortRowPreferenceStrategy** | 2,913 | 32.1 / 40.0 | 2,693 | 32.3 / 40.0 |
+| **MLScorerStrategy** | 3,021 | 31.6 / 40.0 | 2,718 | 32.2 / 40.0 |

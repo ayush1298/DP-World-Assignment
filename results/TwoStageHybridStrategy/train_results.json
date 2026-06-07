@@ -1,0 +1,20 @@
+{
+  "total_events": 20592,
+  "placement_events": 10385,
+  "retrieval_events": 10207,
+  "total_reshuffles": 3022,
+  "reshuffles_per_retrieval": 0.2961,
+  "reshuffle_percentage": 20.93,
+  "max_reshuffles_single": 4,
+  "retrievals_with_reshuffles": 2136,
+  "hard_constraint_violations": 0,
+  "placement_failures": 0,
+  "errors": 0,
+  "final_yard_count": 6311,
+  "elapsed_sec": 253.91,
+  "score_reshuffles": 21.6,
+  "score_violations": 10.0,
+  "quantitative_score": 31.6,
+  "strategy": "solution.my_strategy.TwoStageHybridStrategy",
+  "data_dir": "data/train"
+}
