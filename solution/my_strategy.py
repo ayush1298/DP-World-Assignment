@@ -25,6 +25,7 @@ class MyStrategy(PlacementStrategy):
     ENABLE_T2_PREASSIGN = True   # Vessel pre-assignment (Phase 2)
     ENABLE_T2_ZONING = False     # Bay zone partitioning (Phase 2)
     ENABLE_T3_ROLLOUT = True     # Analytical rollout lookahead (Phase 3)
+    ENABLE_HOMOGENEITY_COHESION = False  # Full stack homogeneity cohesion (Phase 2)
 
     # Rollout hyperparameters
     ROLLOUT_ENABLED       = True
@@ -58,12 +59,13 @@ class MyStrategy(PlacementStrategy):
                 for val in rot.values():
                     dep_times.append(val)
 
-        # Try to find the data_dir from command line arguments
-        data_dir = None
-        for i, arg in enumerate(sys.argv):
-            if arg == "--data-dir" and i + 1 < len(sys.argv):
-                data_dir = sys.argv[i+1]
-                break
+        # Try to find the data_dir from command line arguments or instance attribute
+        data_dir = getattr(self, "data_dir", None)
+        if not data_dir:
+            for i, arg in enumerate(sys.argv):
+                if arg == "--data-dir" and i + 1 < len(sys.argv):
+                    data_dir = sys.argv[i+1]
+                    break
         
         if data_dir:
             events_path = Path(data_dir) / "events.jsonl"
@@ -322,42 +324,45 @@ class MyStrategy(PlacementStrategy):
             height_pen = (height ** 2) * 0.15
 
         # ── 3. Vessel cohesion bonus ──────────────────────────────
-        cohesion_bonus = 0.0
-        # Direct vertical cohesion
-        if height > 0:
-            top_cid = yard_state.get_container_at(block, bay, row, height)
-            if top_cid:
-                top_info = yard_state.get_container_info(top_cid)
-                if top_info and top_info.vessel_id == event.vessel_id:
-                    cohesion_bonus += 2.0
-                    if top_info.port_of_discharge == event.port_of_discharge:
-                        cohesion_bonus += 1.5
+        if getattr(self, "ENABLE_HOMOGENEITY_COHESION", False):
+            cohesion_bonus = self._stack_homogeneity_score(yard_state, block, bay, row, event)
+        else:
+            cohesion_bonus = 0.0
+            # Direct vertical cohesion
+            if height > 0:
+                top_cid = yard_state.get_container_at(block, bay, row, height)
+                if top_cid:
+                    top_info = yard_state.get_container_info(top_cid)
+                    if top_info and top_info.vessel_id == event.vessel_id:
+                        cohesion_bonus += 2.0
+                        if top_info.port_of_discharge == event.port_of_discharge:
+                            cohesion_bonus += 1.5
 
-        # Horizontal cohesion (adjacent stacks in same block)
-        max_bays = layout["bays"]
-        max_rows = layout["rows"]
-        nearby_count = 0
-        for db in (-1, 1):
-            adj_b = bay + db
-            if 1 <= adj_b <= max_bays:
-                adj_h = yard_state.get_stack_height(block, adj_b, row)
-                if adj_h > 0:
-                    adj_cid = yard_state.get_container_at(block, adj_b, row, adj_h)
-                    if adj_cid:
-                        adj_info = yard_state.get_container_info(adj_cid)
-                        if adj_info and adj_info.vessel_id == event.vessel_id:
-                            nearby_count += 1
-        for dr in (-1, 1):
-            adj_r = row + dr
-            if 1 <= adj_r <= max_rows:
-                adj_h = yard_state.get_stack_height(block, bay, adj_r)
-                if adj_h > 0:
-                    adj_cid = yard_state.get_container_at(block, bay, adj_r, adj_h)
-                    if adj_cid:
-                        adj_info = yard_state.get_container_info(adj_cid)
-                        if adj_info and adj_info.vessel_id == event.vessel_id:
-                            nearby_count += 1
-        cohesion_bonus += min(nearby_count * 0.5, 1.5)
+            # Horizontal cohesion (adjacent stacks in same block)
+            max_bays = layout["bays"]
+            max_rows = layout["rows"]
+            nearby_count = 0
+            for db in (-1, 1):
+                adj_b = bay + db
+                if 1 <= adj_b <= max_bays:
+                    adj_h = yard_state.get_stack_height(block, adj_b, row)
+                    if adj_h > 0:
+                        adj_cid = yard_state.get_container_at(block, adj_b, row, adj_h)
+                        if adj_cid:
+                            adj_info = yard_state.get_container_info(adj_cid)
+                            if adj_info and adj_info.vessel_id == event.vessel_id:
+                                nearby_count += 1
+            for dr in (-1, 1):
+                adj_r = row + dr
+                if 1 <= adj_r <= max_rows:
+                    adj_h = yard_state.get_stack_height(block, bay, adj_r)
+                    if adj_h > 0:
+                        adj_cid = yard_state.get_container_at(block, bay, adj_r, adj_h)
+                        if adj_cid:
+                            adj_info = yard_state.get_container_info(adj_cid)
+                            if adj_info and adj_info.vessel_id == event.vessel_id:
+                                nearby_count += 1
+            cohesion_bonus += min(nearby_count * 0.5, 1.5)
 
         # ── 4. Neighborhood penalty ───────────────────────────────
         neighborhood_pen = 0.0
@@ -384,11 +389,11 @@ class MyStrategy(PlacementStrategy):
         block_pen = block_risk * 2.0
 
         # ── Dynamic weights ────────────────────────────────────────
-        alpha = 100.0
-        beta  = 1.0
-        gamma = 0.5
-        delta = 1.5 if occ_ratio > 0.80 else 3.0
-        zeta  = 1.0
+        alpha = getattr(self, "SCORE_ALPHA", 100.0)
+        beta  = getattr(self, "SCORE_BETA", 1.0)
+        gamma = getattr(self, "SCORE_GAMMA", 0.5)
+        delta = getattr(self, "SCORE_DELTA_HIGH", 1.5) if occ_ratio > 0.80 else getattr(self, "SCORE_DELTA_NORMAL", 3.0)
+        zeta  = getattr(self, "SCORE_ZETA", 1.0)
 
         score = (alpha * erc_eff
                  + beta  * height_pen
@@ -592,8 +597,8 @@ class MyStrategy(PlacementStrategy):
             self.non_full_stacks[block].add((bay, row))
 
             # Update block statistics for adaptive penalty (Fix C - Bayesian smoothing)
-            PRIOR_ALPHA = 3   # pseudo-reshuffle count (prior rate = 3/20 = 0.15)
-            PRIOR_BETA  = 17  # pseudo-clean count
+            PRIOR_ALPHA = getattr(self, "PRIOR_ALPHA", 3)   # pseudo-reshuffle count (prior rate = 3/20 = 0.15)
+            PRIOR_BETA  = getattr(self, "PRIOR_BETA", 17)  # pseudo-clean count
 
             self.block_reshuffle_count[block] += reshuffles
             self.block_retrieval_count[block] += 1

@@ -1,5 +1,6 @@
 import json
 import time
+import sys
 from pathlib import Path
 from collections import defaultdict
 from src.yard_state import YardState
@@ -10,6 +11,7 @@ from solution.my_strategy import MyStrategy
 def evaluate_config(data_dir, yard_layout, initial_state, events, config):
     # Create strategy and inject config parameters
     strategy = MyStrategy()
+    strategy.data_dir = data_dir  # Crucial to load exact retrieval times!
     for param, value in config.items():
         setattr(strategy, param, value)
 
@@ -40,20 +42,29 @@ def tune():
     events = read_events(events_path)
     print(f"Loaded {len(events)} events.")
 
-    # Define hyperparameter grid
-    # We will tune one or two at a time to keep it fast, or define a small grid
+    # Define hyperparameter grid around the current best configuration
     grid = [
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.2, "NEIGHBORHOOD_PENALTY": 0.4}, # Default (36.4)
-        {"N_BUCKETS": 4, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.2, "NEIGHBORHOOD_PENALTY": 0.4},
-        {"N_BUCKETS": 6, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.2, "NEIGHBORHOOD_PENALTY": 0.4},
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.85, "TRUCK_UNCERT_MULT": 1.2, "NEIGNBORHOOD_PENALTY": 0.4},
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.92, "TRUCK_UNCERT_MULT": 1.2, "NEIGHBORHOOD_PENALTY": 0.4},
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.0, "NEIGHBORHOOD_PENALTY": 0.4},
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.4, "NEIGHBORHOOD_PENALTY": 0.4},
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.2, "NEIGHBORHOOD_PENALTY": 0.2},
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 4, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.2, "NEIGHBORHOOD_PENALTY": 0.6},
-        # Try MAX_STACK_HEIGHT = 5
-        {"N_BUCKETS": 5, "MAX_STACK_HEIGHT": 5, "MAX_BLOCK_OCCUPANCY": 0.88, "TRUCK_UNCERT_MULT": 1.2, "NEIGHBORHOOD_PENALTY": 0.4},
+        # 1. Baseline / Current Optimal
+        {
+            "TRUCK_UNCERT_MULT": 1.35,
+            "ROLLOUT_FUTURE_WEIGHT": 0.25,
+            "N_BUCKETS": 6,
+            "MAX_BLOCK_OCCUPANCY": 0.88,
+            "SCORE_DELTA_NORMAL": 3.0,
+            "SCORE_DELTA_HIGH": 1.5,
+            "PRIOR_ALPHA": 3,
+        },
+        # 2. Testing full-stack homogeneity cohesion in score
+        {
+            "TRUCK_UNCERT_MULT": 1.35,
+            "ROLLOUT_FUTURE_WEIGHT": 0.25,
+            "N_BUCKETS": 6,
+            "MAX_BLOCK_OCCUPANCY": 0.88,
+            "SCORE_DELTA_NORMAL": 3.0,
+            "SCORE_DELTA_HIGH": 1.5,
+            "PRIOR_ALPHA": 3,
+            "ENABLE_HOMOGENEITY_COHESION": True,
+        },
     ]
 
     print("\n--- Starting Tuning Grid Search ---")
