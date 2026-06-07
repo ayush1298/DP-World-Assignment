@@ -1,3 +1,5 @@
 src/__pycache__
 solution/__pycache__
 tests/__pycache__
+.specstory
+.cursorindexingignore

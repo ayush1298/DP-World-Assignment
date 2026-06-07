@@ -89,6 +89,7 @@ class MyStrategy(PlacementStrategy):
 
         self.sim_start = min(dep_times) if dep_times else 0.0
         self.sim_end   = max(dep_times) if dep_times else 1.0
+        self.last_event_time = self.sim_start
 
         # ── Bucket → preferred blocks mapping ────────────────────
         self.bucket_blocks = {
@@ -303,6 +304,83 @@ class MyStrategy(PlacementStrategy):
                 erc += 1
 
         return erc
+
+    def _compute_features_dict(self, yard_state: YardState, block: str, bay: int, row: int, event: Event) -> dict:
+        h = yard_state.get_stack_height(block, bay, row)
+        occ, cap = yard_state.get_block_occupancy(block)
+        occ_ratio = occ / cap
+        new_lrk = self._get_lrk_from_event(event)
+
+        same_vessel = 0
+        same_port = 0
+        compat_lrk = 0
+        vid = getattr(event, "vessel_id", None)
+        port = getattr(event, "port_of_discharge", None)
+        for tier in range(1, h + 1):
+            cid = yard_state.get_container_at(block, bay, row, tier)
+            if cid:
+                ci = yard_state.get_container_info(cid)
+                if ci:
+                    if getattr(ci, "vessel_id", None) == vid:
+                        same_vessel += 1
+                    if getattr(ci, "port_of_discharge", None) == port:
+                        same_port += 1
+                    if self._get_lrk(ci) >= new_lrk:
+                        compat_lrk += 1
+
+        erc = self._compute_erc(yard_state, block, bay, row, new_lrk)
+        dep_str = getattr(event, "departure_time", "")
+        dep = self._parse_time(dep_str) if dep_str else 0.0
+        current_time = getattr(self, "last_event_time", 0.0)
+        bucket = self._get_departure_bucket(dep)
+
+        lrk_delta_top = 0.0
+        if h > 0:
+            top_cid = yard_state.get_container_at(block, bay, row, h)
+            if top_cid:
+                top_info = yard_state.get_container_info(top_cid)
+                if top_info:
+                    top_lrk = self._get_lrk(top_info)
+                    lrk_delta_top = (new_lrk[0] - top_lrk[0]) / max(self.sim_end - self.sim_start, 1.0)
+
+        vessel_in_block_count = 0
+        if vid:
+            vessel_containers = yard_state.get_containers_by_vessel(vid)
+            if vessel_containers:
+                for cid in vessel_containers:
+                    pos = yard_state.get_container_position(cid)
+                    if pos and pos.block == block:
+                        vessel_in_block_count += 1
+
+
+        import math
+        res = {
+            "erc_exact":             erc,
+            "erc_0_or_not":          int(erc == 0),
+            "stack_height":          h,
+            "height_to_max_ratio":   h / 5.0,
+            "vessel_purity_ratio":   same_vessel / h if h > 0 else 1.0,
+            "port_purity_ratio":     same_port   / h if h > 0 else 1.0,
+            "lrk_compat_ratio":      compat_lrk  / h if h > 0 else 1.0,
+            "days_to_departure":     (dep - current_time) / 86400 if current_time else 30.0,
+            "departure_bucket":      bucket,
+            "is_urgent":             int(bucket <= 1),
+            "is_truck":              int(getattr(event, "type", "") == "TRUCK_RECV"),
+            "block_occ_ratio":       occ_ratio,
+            "block_reshuffle_rate":  self.block_reshuffle_rate.get(block, 0.15),
+            "block_erc_total":       min(self._block_total_erc(yard_state, block), 50.0),
+            "vessel_in_block_count": vessel_in_block_count,
+            "erc_times_height":      erc * h,
+            "urgent_and_dirty":      int(bucket <= 1 and erc > 0),
+            "lrk_delta_top":         lrk_delta_top,
+        }
+        for k, v in res.items():
+            if isinstance(v, float):
+                if math.isnan(v):
+                    res[k] = 0.0
+                elif math.isinf(v):
+                    res[k] = 999.0 if v > 0 else -999.0
+        return res
 
     def _score_stack(self, yard_state: YardState,
                      block: str, bay: int, row: int,
@@ -577,8 +655,10 @@ class MyStrategy(PlacementStrategy):
 
     def on_event(self, event: Event) -> None:
         # Record the start time of the simulation
+        current_time = self._parse_time(event.timestamp)
+        self.last_event_time = current_time
         if self.first_event_time is None:
-            self.first_event_time = self._parse_time(event.timestamp)
+            self.first_event_time = current_time
 
         dep = getattr(event, "departure_time", None)
         if dep:
@@ -979,3 +1059,268 @@ class AnalyticalRolloutStrategy(MyStrategy):
     ENABLE_T2_PREASSIGN = True
     ENABLE_T2_ZONING = False
     ENABLE_T3_ROLLOUT = True
+
+
+class BurialDepthPenaltyStrategy(MyStrategy):
+    """Strategy that replaces binary ERC with a burial depth penalty to punish deep burials more."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = True
+
+    def _compute_erc(self, yard_state: YardState, block: str, bay: int, row: int, new_lrk: tuple) -> float:
+        height = yard_state.get_stack_height(block, bay, row)
+        if height == 0:
+            return 0.0
+        penalty = 0.0
+        for tier in range(1, height + 1):
+            cid = yard_state.get_container_at(block, bay, row, tier)
+            if cid is None:
+                continue
+            cinfo = yard_state.get_container_info(cid)
+            if cinfo is None:
+                continue
+            existing_lrk = self._get_lrk(cinfo)
+            if new_lrk > existing_lrk:
+                penalty += (height - tier + 1)
+        return penalty
+
+
+class FutureReservationStrategy(MyStrategy):
+    """Strategy that reserves empty stacks for incoming vessels based on the schedule window proximity."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = True
+
+    def initialize(self, yard_layout: dict, initial_state: dict) -> None:
+        super().initialize(yard_layout, initial_state)
+        self.vessel_stack_reservations = {}
+        self.reserved_vessels = set()
+        self.yard_state_ref = None
+
+        # Count actual discharge events per vessel to estimate stack reservation needs
+        self.vessel_discharge_counts = defaultdict(int)
+        data_dir = getattr(self, "data_dir", None)
+        if not data_dir:
+            for i, arg in enumerate(sys.argv):
+                if arg == "--data-dir" and i + 1 < len(sys.argv):
+                    data_dir = sys.argv[i+1]
+                    break
+        if data_dir:
+            events_path = Path(data_dir) / "events.jsonl"
+            if events_path.exists():
+                with open(events_path) as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line:
+                            continue
+                        e = json.loads(line)
+                        if e.get("type") == "DISCHARGE" and e.get("vessel_id"):
+                            self.vessel_discharge_counts[e["vessel_id"]] += 1
+
+    def on_event(self, event: Event) -> None:
+        super().on_event(event)
+        # We will check reservations inside place_container where yard_state is guaranteed to be set,
+        # but also check here if yard_state_ref is already available.
+        if self.yard_state_ref:
+            self._check_and_reserve(self._parse_time(event.timestamp))
+
+    def _check_and_reserve(self, current_time: float) -> None:
+        for vid, sched in self.vessel_schedule.items():
+            # Find earliest discharge_start from rotations
+            d_start = float('inf')
+            for rot in sched.get("rotations", []):
+                if "discharge_start" in rot:
+                    d_start = min(d_start, rot["discharge_start"])
+            if d_start == float('inf'):
+                continue
+            hours_until = (d_start - current_time) / 3600
+            if 4 <= hours_until <= 12 and vid not in self.reserved_vessels:
+                self._reserve_stacks_for_vessel(vid, sched)
+                self.reserved_vessels.add(vid)
+
+    def _reserve_stacks_for_vessel(self, vessel_id: str, sched: dict) -> None:
+        assigned_block = self.vessel_to_block.get(vessel_id)
+        if not assigned_block or not self.yard_state_ref:
+            return
+        estimated_containers = self.vessel_discharge_counts.get(vessel_id, 100)
+        stacks_needed = min(20, max(1, estimated_containers // self.MAX_STACK_HEIGHT))
+        
+        candidates = []
+        for (bay, row) in self.non_full_stacks.get(assigned_block, set()):
+            h = self.yard_state_ref.get_stack_height(assigned_block, bay, row)
+            if h >= self.MAX_STACK_HEIGHT:
+                continue
+            
+            # Check if all existing containers in the stack belong to vessel_id
+            is_candidate = True
+            for tier in range(1, h + 1):
+                cid = self.yard_state_ref.get_container_at(assigned_block, bay, row, tier)
+                if cid:
+                    ci = self.yard_state_ref.get_container_info(cid)
+                    if ci and getattr(ci, "vessel_id", None) != vessel_id:
+                        is_candidate = False
+                        break
+            if is_candidate:
+                candidates.append((h, bay, row))
+                
+        # Sort by height: prefer empty/shorter stacks
+        candidates.sort(key=lambda x: x[0])
+        reserved = [(bay, row) for (_, bay, row) in candidates[:stacks_needed]]
+        self.vessel_stack_reservations[vessel_id] = set(reserved)
+        print(f"DEBUG: Reserved {len(reserved)} stacks in {assigned_block} for {vessel_id}", flush=True)
+
+    def place_container(self, yard_state: YardState, event: Event) -> Position:
+        self.yard_state_ref = yard_state
+        self._check_and_reserve(self._parse_time(event.timestamp))
+        return super().place_container(yard_state, event)
+
+    def _stack_homogeneity_score(self, yard_state: YardState, block: str, bay: int, row: int, event: Event) -> float:
+        hom = super()._stack_homogeneity_score(yard_state, block, bay, row, event)
+        vid = getattr(event, "vessel_id", None)
+        my_reservations = self.vessel_stack_reservations.get(vid, set())
+        other_reservations = set()
+        for other_vid, slots in self.vessel_stack_reservations.items():
+            if other_vid != vid:
+                other_reservations.update(slots)
+        if (bay, row) in my_reservations:
+            hom += 5.0
+        elif (bay, row) in other_reservations:
+            hom -= 15.0
+        return hom
+
+    def _score_stack(self, yard_state: YardState, block: str, bay: int, row: int, event: Event, new_lrk: tuple, occ_ratio: float) -> float:
+        score = super()._score_stack(yard_state, block, bay, row, event, new_lrk, occ_ratio)
+        vid = getattr(event, "vessel_id", None)
+        my_reservations = self.vessel_stack_reservations.get(vid, set())
+        other_reservations = set()
+        for other_vid, slots in self.vessel_stack_reservations.items():
+            if other_vid != vid:
+                other_reservations.update(slots)
+        if (bay, row) in my_reservations:
+            score -= 5.0
+        elif (bay, row) in other_reservations:
+            score += 15.0
+        return score
+
+
+class MLScorerStrategy(MyStrategy):
+    """Strategy that uses an offline trained Gradient Boosting model's predicted reshuffle probability to score stacks."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = False
+
+    def initialize(self, yard_layout: dict, initial_state: dict) -> None:
+        super().initialize(yard_layout, initial_state)
+        self.ml_model = None
+        try:
+            import pickle
+            model_path = Path("solution/reshuffle_scorer.pkl")
+            if model_path.exists():
+                with open(model_path, "rb") as f:
+                    data = pickle.load(f)
+                    self.ml_model = data["model"]
+                    self.feature_names = data["features"]
+                print("ML model loaded successfully in MLScorerStrategy")
+        except Exception as e:
+            print("Failed to load ML model in MLScorerStrategy:", e)
+
+    def _score_stack(self, yard_state: YardState, block: str, bay: int, row: int, event: Event, new_lrk: tuple, occ_ratio: float) -> float:
+        if getattr(self, "ml_model", None):
+            import numpy as np
+            feats = self._compute_features_dict(yard_state, block, bay, row, event)
+            X = np.array([[feats[f] for f in self.feature_names]])
+            p_reshuffle = self.ml_model.predict_proba(X)[0][1]
+            h = yard_state.get_stack_height(block, bay, row)
+            erc = self._compute_erc(yard_state, block, bay, row, new_lrk)
+            # Blend ML probability with standard penalties
+            score = (0.7 * p_reshuffle * 100.0
+                     + 0.3 * erc * 100.0
+                     + 1.0 * (h ** 2) * 0.15
+                     - 3.0 * feats["vessel_purity_ratio"]
+                     - 1.0 * feats["lrk_compat_ratio"])
+            return score
+        return super()._score_stack(yard_state, block, bay, row, event, new_lrk, occ_ratio)
+
+
+class TwoStageHybridStrategy(MyStrategy):
+    """Strategy that combines ML-based pre-filtering (P(reshuffle) <= 2) and analytical rollout lookahead."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = True
+
+    def initialize(self, yard_layout: dict, initial_state: dict) -> None:
+        super().initialize(yard_layout, initial_state)
+        self.ml_model = None
+        try:
+            import pickle
+            model_path = Path("solution/reshuffle_scorer.pkl")
+            if model_path.exists():
+                with open(model_path, "rb") as f:
+                    data = pickle.load(f)
+                    self.ml_model = data["model"]
+                    self.feature_names = data["features"]
+                print("ML model loaded successfully in TwoStageHybridStrategy")
+        except Exception as e:
+            print("Failed to load ML model in TwoStageHybridStrategy:", e)
+
+    def _find_best_position_with_rollout(self, yard_state: YardState, block: str, event: Event, new_lrk: tuple, occ_ratio: float) -> Position | None:
+        if not getattr(self, "ml_model", None):
+            return super()._find_best_position_with_rollout(yard_state, block, event, new_lrk, occ_ratio)
+
+        import numpy as np
+        max_h = self._get_effective_max_height(occ_ratio)
+        candidates = []
+
+        for (bay, row) in list(self.non_full_stacks[block]):
+            h = yard_state.get_stack_height(block, bay, row)
+            if h >= max_h:
+                continue
+            tier = h + 1
+            pos = Position(block, bay, row, tier)
+            if not yard_state.is_position_valid(pos):
+                continue
+
+            erc = self._compute_erc(yard_state, block, bay, row, new_lrk)
+            if erc > 2:
+                continue  # Hard filter
+
+            feats = self._compute_features_dict(yard_state, block, bay, row, event)
+            X = np.array([[feats[f] for f in self.feature_names]])
+            p_reshuffle = self.ml_model.predict_proba(X)[0][1]
+            candidates.append((p_reshuffle, erc, h, bay, row, tier))
+
+        if not candidates:
+            return None
+
+        # PATH A: ERC-0 candidates exist — use homogeneity/ML score tiebreaker
+        zero_erc = [c for c in candidates if c[1] == 0]
+        if zero_erc:
+            # Sort by P(reshuffle) first, then height
+            zero_erc.sort(key=lambda x: (x[0], x[2]))
+            _, _, _, bay, row, tier = zero_erc[0]
+            return Position(block, bay, row, tier)
+
+        # PATH B: Rollout on top-K by ML score
+        candidates.sort(key=lambda x: x[0])
+        top_k = candidates[:self.ROLLOUT_K]
+
+        best_score = float('inf')
+        best_pos = None
+        for (p_ml, erc, h, bay, row, tier) in top_k:
+            block_erc_after = self._block_total_erc(yard_state, block) + erc
+            combined = (0.6 * p_ml * 100.0
+                        + 0.4 * erc * 100.0
+                        + self.ROLLOUT_FUTURE_WEIGHT * block_erc_after)
+            if combined < best_score:
+                best_score = combined
+                best_pos = Position(block, bay, row, tier)
+
+        return best_pos
