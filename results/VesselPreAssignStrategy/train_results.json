@@ -1,0 +1,20 @@
+{
+  "total_events": 20592,
+  "placement_events": 10385,
+  "retrieval_events": 10207,
+  "total_reshuffles": 3021,
+  "reshuffles_per_retrieval": 0.296,
+  "reshuffle_percentage": 20.49,
+  "max_reshuffles_single": 4,
+  "retrievals_with_reshuffles": 2091,
+  "hard_constraint_violations": 0,
+  "placement_failures": 0,
+  "errors": 0,
+  "final_yard_count": 6311,
+  "elapsed_sec": 21.96,
+  "score_reshuffles": 21.6,
+  "score_violations": 10.0,
+  "quantitative_score": 31.6,
+  "strategy": "solution.my_strategy.VesselPreAssignStrategy",
+  "data_dir": "data/train"
+}

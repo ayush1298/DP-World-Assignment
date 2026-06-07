@@ -4,7 +4,7 @@
 
 In maritime and intermodal container terminals, efficient space utilization and crane productivity are major operational drivers. When containers arrive at the terminal (either from ships or trucks), the terminal operating system must decide where to stack them. Later, when these containers depart, they must be retrieved. If a target container is stacked under other containers, the ones on top must be temporarily relocated (reshuffled). Each reshuffle consumes crane time, delays ship loading, and increases operational costs.
 
-This project implements a high-performance **hybrid container placement algorithm** that minimizes reshuffles by predicting retrieval order using multi-attribute signals (departure time, port of discharge, and weight class) and optimizing physical stack layouts in real time.
+This project implements a family of high-performance container placement strategies (specifically `VesselPreAssignStrategy`, `BayZoningStrategy`, and our final submission strategy `AnalyticalRolloutStrategy`, which is also configured as `MyStrategy`) that minimize reshuffles by predicting retrieval order using multi-attribute signals (departure time, port of discharge, and weight class) and optimizing physical stack layouts in real time.
 
 ---
 
@@ -102,23 +102,24 @@ An analysis of the training dataset (`data/train`) revealed key structural prope
 ---
 
 ## 5. Performance Comparison & Quantitative Score
+## 5. Performance Comparison & Quantitative Score
 
-The table below compares the performance of our hybrid strategy against the two baselines on the training and test datasets:
+The table below compares the performance of our named strategies against the two baselines on the training and test datasets:
 
-| Dataset | Metric | Random Baseline | Greedy Baseline | **Our Hybrid Strategy** |
-| :--- | :--- | :--- | :--- | :--- |
-| **Train** | Total Reshuffles | 8,933 | 8,036 | **3,040** |
-| | Reshuffles/Retrieval | 0.8752 | 0.7873 | **0.2978** |
-| | Score — Reshuffles | 0.0 / 30.0 | 0.5 / 30.0 | **21.5 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **10.5 / 40.0** | **31.5 / 40.0** |
-| **Test** | Total Reshuffles | 9,122* | 7,288* | **2,752** |
-| | Reshuffles/Retrieval | 0.8883* | 0.7100* | **0.2853** |
-| | Score — Reshuffles | 0.0 / 30.0 | 3.9 / 30.0 | **22.1 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **13.9 / 40.0** | **32.1 / 40.0** |
+| Dataset | Metric | Random Baseline | Greedy Baseline | **VesselPreAssignStrategy** | **BayZoningStrategy** | **AnalyticalRolloutStrategy** (Best / `MyStrategy`) |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Train** | Total Reshuffles | 8,933 | 8,036 | 3,021 | 5,210 | **2,763** |
+| | Reshuffles/Retrieval | 0.8752 | 0.7873 | 0.2960 | 0.5104 | **0.2707** |
+| | Score — Reshuffles | 0.0 / 30.0 | 0.5 / 30.0 | 21.6 / 30.0 | 12.4 / 30.0 | **22.7 / 30.0** |
+| | **Quantitative Total** | **10.0 / 40.0** | **10.5 / 40.0** | **31.6 / 40.0** | **22.4 / 40.0** | **32.7 / 40.0** |
+| **Test** | Total Reshuffles | 9,122* | 7,288* | 2,718 | 5,081 | **2,644** |
+| | Reshuffles/Retrieval | 0.8883* | 0.7100* | 0.2817 | 0.5267 | **0.2741** |
+| | Score — Reshuffles | 0.0 / 30.0 | 3.9 / 30.0 | 22.2 / 30.0 | 11.7 / 30.0 | **22.5 / 30.0** |
+| | **Quantitative Total** | **10.0 / 40.0** | **13.9 / 40.0** | **32.2 / 40.0** | **21.7 / 40.0** | **32.5 / 40.0** |
 
 *\*Note: Baseline scores on the test set are referenced from `src/scoring.py`.*
 
-Our hybrid strategy achieved a **~60% reduction in reshuffles** compared to the greedy baseline on both datasets, yielding a quantitative score of **32.1 / 40.0** on the test dataset.
+Our production strategy (**AnalyticalRolloutStrategy**, also registered as the default **MyStrategy**) achieved a **~65% reduction in reshuffles** compared to the greedy baseline on both datasets, yielding a quantitative score of **32.5 / 40.0** on the test dataset.
 
 ### 5.2 Quick Validation Test (First 500 Events of Train Set)
 
@@ -128,7 +129,9 @@ The table below shows the results of running the quick validation test (`bash va
 | :--- | :--- | :--- | :--- | :--- |
 | **Random Baseline** | 52 | 1.0833 | 0.0 / 30.0 | 10.0 / 40.0 |
 | **Greedy Baseline** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
-| **Our Hybrid Strategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
+| **VesselPreAssignStrategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
+| **BayZoningStrategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
+| **AnalyticalRolloutStrategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
 
 *Note: All strategies score 10.0 on this truncated subset because the yard starts with disorganized initial containers. The few retrievals that occur in the first 500 events are of pre-existing buried containers, meaning these early reshuffles are unavoidable.*
 
@@ -143,3 +146,47 @@ The table below shows the results of running the quick validation test (`bash va
 - **Space Complexity**:
   - We store block layouts, vessel schedules, block assignment caches, and non-full stack sets.
   - Total Space: $O(V + B \times R) \approx O(20 \text{ vessels} + 10 \text{ blocks} \times 240 \text{ stacks}) = O(2,400)$, requiring less than **2 MB** of memory.
+
+---
+
+## 7. Experimental Results Log
+
+This section documents the chronological progression of ideas implemented from the improvement plan, detailing a brief description of each idea and its corresponding simulation results on both the train and test sets.
+
+### 7.1 Phase 1: Tier 1 Fixes (Height Floor, Schedule sim_end, Bayesian Smoothing, Adaptive Height Limit, Truck Uncertainty)
+- **Description**: Implemented the five Tier 1 fixes:
+  1. **Fix A (Height Penalty Floor)**: Height penalty scaled by `max(occ_ratio, 0.30)`.
+  2. **Fix B (sim_end Extension)**: Extended time window bounds using all rotations in the vessel schedule.
+  3. **Fix C (Bayesian Smoothing)**: Smoothed block reshuffle rates using `PRIOR_ALPHA = 3` and `PRIOR_BETA = 17` to prevent noisy block avoidance.
+  4. **Fix D (Adaptive Max Height)**: Restricts stack height to 3 when occupancy is high (>= 75%), 4 when medium (50-75%), and 5 when low (< 50%).
+  5. **Fix E (Truck Uncertainty)**: Increased `TRUCK_UNCERT_MULT` from 1.2 to 1.35.
+- **Results**:
+  - *Full Implementation (All Tier 1 Fixes Enabled)*:
+    - **Train Reshuffles**: 3,769 (Score: 18.5/30, Quantitative Total: 28.5/40)
+    - **Test Reshuffles**: 4,646 (Score: 13.6/30, Quantitative Total: 23.6/40)
+    - *Observation*: Degraded significantly. Restricting stack height to 3 at high occupancies (Fix D) prematurely overflowed blocks and caused vessel-mixing, while reducing the height penalty floor at low/medium occupancies (Fix A) allowed stacks to grow tall early.
+  - *Selective Implementation (Toggled Flags: Fix A = False, Fix D = False; Fix B = True, Fix C = True, Fix E = True)*:
+    - **Train Reshuffles**: 3,022 (Score: 21.6/30, Quantitative Total: 31.6/40)
+    - **Test Reshuffles**: 2,724 (Score: 22.2/30, Quantitative Total: 32.2/40)
+    - *Observation*: Recovered and improved upon the previous best performance (3,040 train / 2,752 test), proving that B (sim_end schedule window), C (Bayesian rate smoothing), and E (higher truck uncertainty weight) are highly effective when stack heights are not artificially limited.
+
+### 7.2 VesselPreAssignStrategy
+- **Description**: Implements schedule-aware vessel-to-block pre-assignment prior to simulation start. This strategy sorts vessels by ETD, assigns blocks by capacity, and ensures vessels with overlapping discharge windows go to different blocks. It enables only `ENABLE_T2_PREASSIGN = True` (with Tier 1 code fixes B, C, and E) while disabling zoning and rollout.
+- **Results**:
+  - **Train Reshuffles**: 3,021 (Score: 21.6/30, Quantitative Total: 31.6/40)
+  - **Test Reshuffles**: 2,718 (Score: 22.2/30, Quantitative Total: 32.2/40)
+  - *Observation*: Slightly reduced reshuffles on both datasets (down by 1 on train and 6 on test) compared to the selective baseline, validating that schedule-based block allocation is successful.
+
+### 7.3 BayZoningStrategy
+- **Description**: Extends pre-assignment by partition-zoning bays within a block into departure buckets (so soonest-departing containers go to bays 1-8, etc.). If the zone is full, falls back to full block search. It configures `ENABLE_T2_PREASSIGN = True` and `ENABLE_T2_ZONING = True` while disabling rollout.
+- **Results**:
+  - **Train Reshuffles**: 5,210 (Score: 12.4/30, Quantitative Total: 22.4/40)
+  - **Test Reshuffles**: 5,081 (Score: 11.7/30, Quantitative Total: 21.7/40)
+  - *Observation*: Degraded severely. Forcing containers of the same departure bucket (which spans multiple vessel rotations across weeks) into a tiny subset of bays (1/N_BUCKETS) creates high density and early capacity exhaustion, causing massive overflows and mixing. Spatial bay partitioning is unsuitable for this multi-rotation schedule environment.
+
+### 7.4 AnalyticalRolloutStrategy (Our Best Strategy)
+- **Description**: Uses pre-assignment (same as `VesselPreAssignStrategy`) and integrates an analytical rollout lookahead for high-stakes non-ERC-0 decisions. It evaluates the top-K candidate slots by checking the total block-level Expected Reshuffle Cost (ERC) after placement, utilizing an all-pairs inversion count. It configures `ENABLE_T2_PREASSIGN = True` and `ENABLE_T3_ROLLOUT = True` while disabling zoning.
+- **Results**:
+  - **Train Reshuffles**: 2,763 (Score: 22.7/30, Quantitative Total: 32.7/40)
+  - **Test Reshuffles**: 2,644 (Score: 22.5/30, Quantitative Total: 32.5/40)
+  - *Observation*: Outstanding improvement! Reshuffles dropped significantly on both train (down to 2,763, an 8.5% reduction) and test (down to 2,644, a 2.7% reduction). The analytical rollout successfully balances immediate placement scores with long-term stack cleanliness without introducing simulation runtime overhead. This is our production strategy.

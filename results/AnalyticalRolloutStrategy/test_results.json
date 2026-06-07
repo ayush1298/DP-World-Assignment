@@ -11,10 +11,10 @@
   "placement_failures": 0,
   "errors": 0,
   "final_yard_count": 5985,
-  "elapsed_sec": 29.42,
+  "elapsed_sec": 29.39,
   "score_reshuffles": 22.5,
   "score_violations": 10.0,
   "quantitative_score": 32.5,
-  "strategy": "solution.my_strategy.MyStrategy",
+  "strategy": "solution.my_strategy.AnalyticalRolloutStrategy",
   "data_dir": "data/test"
 }

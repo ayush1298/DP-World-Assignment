@@ -129,12 +129,13 @@ def test_vessel_mixing_penalty(empty_yard):
     assert score_mixed - score_homo > 10.0
 
 
-def test_height_penalty_independent_of_occupancy(empty_yard):
+def test_height_penalty_occupancy_floor(empty_yard):
     strategy = MyStrategy()
     strategy.initialize(
         {"blocks": {"B01": {"bays": 5, "rows": 5, "tiers": 5}}},
         {"containers": []}
     )
+    strategy.ENABLE_FIX_A = True
     
     # Place containers on B01, bay 1, row 1 to reach height 2
     c1 = _make_container(cid="C1", vessel="V1", dep_time="2025-01-20T12:00:00")
@@ -145,9 +146,14 @@ def test_height_penalty_independent_of_occupancy(empty_yard):
     event = _make_container(cid="C3", vessel="V1", dep_time="2025-01-10T12:00:00")
     new_lrk = strategy._get_lrk_from_event(event)
 
-    # Score with low yard occupancy vs high yard occupancy (both below 0.8 threshold)
-    score_low_occ = strategy._score_stack(empty_yard, "B01", 1, 1, event, new_lrk, 0.05)
-    score_high_occ = strategy._score_stack(empty_yard, "B01", 1, 1, event, new_lrk, 0.75)
+    # Score with occupancy ratios below the 0.30 floor (e.g., 0.05 and 0.20)
+    score_low_1 = strategy._score_stack(empty_yard, "B01", 1, 1, event, new_lrk, 0.05)
+    score_low_2 = strategy._score_stack(empty_yard, "B01", 1, 1, event, new_lrk, 0.20)
 
-    # The scores should be identical because height penalty is independent of occupancy ratio.
-    assert score_low_occ == score_high_occ
+    # Score with occupancy ratio above the floor (e.g., 0.75)
+    score_high = strategy._score_stack(empty_yard, "B01", 1, 1, event, new_lrk, 0.75)
+
+    # Below the floor, scores should be identical
+    assert score_low_1 == score_low_2
+    # Above the floor, the score (which is penalized) should be higher
+    assert score_high > score_low_1

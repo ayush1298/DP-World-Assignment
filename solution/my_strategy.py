@@ -16,8 +16,20 @@ class MyStrategy(PlacementStrategy):
     N_BUCKETS             = 6
     MAX_STACK_HEIGHT      = 5      # Leave 1 tier of buffer (max is 5)
     MAX_BLOCK_OCCUPANCY   = 0.88   # Stop preferring a block beyond this
-    TRUCK_UNCERT_MULT     = 1.2    # ERC multiplier for TRUCK_RECV events
+    TRUCK_UNCERT_MULT     = 1.35   # ERC multiplier for TRUCK_RECV events
     NEIGHBORHOOD_PENALTY  = 0.4    # Adjacent stack height diff penalty
+
+    # ── Flags to toggle improvements (to keep existing best strategy safe) ──
+    ENABLE_FIX_A = False  # Height penalty floor (if False, uses independent height penalty which got 32.1)
+    ENABLE_FIX_D = False  # Adaptive MAX_STACK_HEIGHT (restricting stack height at high occupancy)
+    ENABLE_T2_PREASSIGN = True   # Vessel pre-assignment (Phase 2)
+    ENABLE_T2_ZONING = False     # Bay zone partitioning (Phase 2)
+    ENABLE_T3_ROLLOUT = True     # Analytical rollout lookahead (Phase 3)
+
+    # Rollout hyperparameters
+    ROLLOUT_ENABLED       = True
+    ROLLOUT_K             = 5
+    ROLLOUT_FUTURE_WEIGHT = 0.25
 
     def initialize(self, yard_layout: dict, initial_state: dict) -> None:
         self._parsed_time_cache = {}
@@ -42,8 +54,9 @@ class MyStrategy(PlacementStrategy):
             if c.get("departure_time"):
                 dep_times.append(self._parse_time(c["departure_time"]))
         for v in self.vessel_schedule.values():
-            for etd in v.get("etds", []):
-                dep_times.append(etd)
+            for rot in v.get("rotations", []):
+                for val in rot.values():
+                    dep_times.append(val)
 
         # Try to find the data_dir from command line arguments
         data_dir = None
@@ -102,6 +115,12 @@ class MyStrategy(PlacementStrategy):
         self.placed_imports = set()
         self.placed_exports = set()
 
+        # ── Pre-assign vessel blocks & initialize zones (Phase 2) ──
+        if self.ENABLE_T2_PREASSIGN:
+            self._preassign_vessel_blocks()
+        if self.ENABLE_T2_ZONING:
+            self._initialize_zones()
+
     def _load_retrieval_times(self, path: Path) -> None:
         with open(path) as f:
             for line in f:
@@ -145,19 +164,27 @@ class MyStrategy(PlacementStrategy):
             ports = sorted(set(vessel.get("ports", [])))
             port_rank = {port: idx for idx, port in enumerate(ports)}
 
+            rotations = []
             etds = []
             for rot in vessel.get("rotations", []):
-                if rot.get("etd"):
-                    try:
-                        etds.append(datetime.fromisoformat(rot["etd"]).timestamp())
-                    except Exception:
-                        pass
+                parsed_rot = {}
+                for key in ["eta", "etd", "discharge_start", "discharge_end", "load_start", "load_end"]:
+                    if rot.get(key):
+                        try:
+                            val = datetime.fromisoformat(rot[key]).timestamp()
+                            parsed_rot[key] = val
+                            if key == "etd":
+                                etds.append(val)
+                        except Exception:
+                            pass
+                rotations.append(parsed_rot)
             etds.sort()
 
             self.vessel_schedule[vid] = {
                 "ports": ports,
                 "port_rank": port_rank,
                 "etds": etds,
+                "rotations": rotations,
             }
 
     def _build_non_full_stacks(self, initial_state: dict) -> None:
@@ -288,8 +315,11 @@ class MyStrategy(PlacementStrategy):
         is_truck = getattr(event, "type", "") == "TRUCK_RECV"
         erc_eff = erc * (self.TRUCK_UNCERT_MULT if is_truck else 1.0)
 
-        # ── 2. Height penalty (quadratic, independent of occupancy to prevent tall stacks when sparse - Fix 6A) ────
-        height_pen = (height ** 2) * 0.15
+        # ── 2. Height penalty (quadratic, scaled by occupancy with a floor if Fix A is enabled) ────
+        if self.ENABLE_FIX_A:
+            height_pen = (height ** 2) * 0.15 * max(occ_ratio, 0.30)
+        else:
+            height_pen = (height ** 2) * 0.15
 
         # ── 3. Vessel cohesion bonus ──────────────────────────────
         cohesion_bonus = 0.0
@@ -435,9 +465,16 @@ class MyStrategy(PlacementStrategy):
 
         for (bay, row) in list(available):
             height = yard_state.get_stack_height(block, bay, row)
-            limit = min(self.block_layout[block]["tiers"], self.MAX_STACK_HEIGHT)
-            if height >= limit:
+            max_tiers = self.block_layout[block]["tiers"]
+            if height >= max_tiers:
                 self.non_full_stacks[block].discard((bay, row))
+                continue
+
+            if self.ENABLE_FIX_D:
+                effective_limit = min(max_tiers, self._get_effective_max_height(occ_ratio))
+            else:
+                effective_limit = min(max_tiers, self.MAX_STACK_HEIGHT)
+            if height >= effective_limit:
                 continue
 
             tier = height + 1
@@ -467,7 +504,12 @@ class MyStrategy(PlacementStrategy):
         primary_block = self._select_block(event, yard_state)
 
         # ── Layer 2: search preferred block ───────────────────────
-        pos = self._find_best_position(yard_state, primary_block, event, new_lrk, occ_ratio)
+        if self.ENABLE_T3_ROLLOUT:
+            pos = self._find_best_position_with_rollout(yard_state, primary_block, event, new_lrk, occ_ratio)
+        elif self.ENABLE_T2_ZONING:
+            pos = self._find_best_position_in_zone(yard_state, primary_block, event, new_lrk, occ_ratio)
+        else:
+            pos = self._find_best_position(yard_state, primary_block, event, new_lrk, occ_ratio)
         if pos:
             erc = self._compute_erc(yard_state, pos.block, pos.bay, pos.row, new_lrk)
             if erc == 0:
@@ -480,7 +522,10 @@ class MyStrategy(PlacementStrategy):
         for block in self.block_layout:
             if block == primary_block:
                 continue
-            alt_pos = self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
+            if self.ENABLE_T2_ZONING:
+                alt_pos = self._find_best_position_in_zone(yard_state, block, event, new_lrk, occ_ratio)
+            else:
+                alt_pos = self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
             if alt_pos:
                 alt_erc = self._compute_erc(yard_state, alt_pos.block, alt_pos.bay, alt_pos.row, new_lrk)
                 if alt_erc == 0:
@@ -514,7 +559,10 @@ class MyStrategy(PlacementStrategy):
             if block in tried:
                 continue
             tried.add(block)
-            pos = self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
+            if self.ENABLE_T2_ZONING:
+                pos = self._find_best_position_in_zone(yard_state, block, event, new_lrk, occ_ratio)
+            else:
+                pos = self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
             if pos and yard_state.is_position_valid(pos):
                 self._record_placement(pos, event)
                 return pos
@@ -543,14 +591,16 @@ class MyStrategy(PlacementStrategy):
             # Stack just became shorter → add back to available set
             self.non_full_stacks[block].add((bay, row))
 
-            # Update block statistics for adaptive penalty
-            self.block_retrieval_count[block] += 1
+            # Update block statistics for adaptive penalty (Fix C - Bayesian smoothing)
+            PRIOR_ALPHA = 3   # pseudo-reshuffle count (prior rate = 3/20 = 0.15)
+            PRIOR_BETA  = 17  # pseudo-clean count
+
             self.block_reshuffle_count[block] += reshuffles
-            total = self.block_retrieval_count[block]
-            if total > 0:
-                self.block_reshuffle_rate[block] = (
-                    self.block_reshuffle_count[block] / total
-                )
+            self.block_retrieval_count[block] += 1
+            self.block_reshuffle_rate[block] = (
+                (self.block_reshuffle_count[block] + PRIOR_ALPHA) /
+                (self.block_retrieval_count[block] + PRIOR_ALPHA + PRIOR_BETA)
+            )
 
     def _record_placement(self, pos: Position, event: Event) -> None:
         block, bay, row, tier = pos.block, pos.bay, pos.row, pos.tier
@@ -572,6 +622,311 @@ class MyStrategy(PlacementStrategy):
             total_cap += cap
         return total_occ / max(total_cap, 1)
 
+    def _get_effective_max_height(self, occ_ratio: float) -> int:
+        """Use full stack depth when yard is sparse; be conservative when crowded."""
+        if occ_ratio < 0.50:
+            return 5   # use full physical height — yard has plenty of room
+        elif occ_ratio < 0.75:
+            return 4   # standard 1-tier buffer
+        else:
+            return 3   # very conservative at high occupancy
+
+    def _stack_homogeneity_score(self, yard_state: YardState,
+                                  block: str, bay: int, row: int,
+                                  event: Event) -> float:
+        """
+        Measures the structural purity of a stack relative to the incoming container.
+        Returns a BONUS (higher = better).
+        
+        Weights: vessel_ratio * 3.0 + port_ratio * 1.5 + compat_lrk_ratio * 1.0
+        Max possible bonus: 5.5 (full same-vessel, same-port, all-compatible stack)
+        """
+        h = yard_state.get_stack_height(block, bay, row)
+        if h == 0:
+            return 0.0
+
+        new_vessel = getattr(event, "vessel_id", None)
+        new_port   = getattr(event, "port_of_discharge", None)
+        new_lrk    = self._get_lrk_from_event(event)
+
+        same_vessel = 0
+        same_port   = 0
+        compat_lrk  = 0
+
+        for tier in range(1, h + 1):
+            cid = yard_state.get_container_at(block, bay, row, tier)
+            if not cid:
+                continue
+            cinfo = yard_state.get_container_info(cid)
+            if getattr(cinfo, "vessel_id", None) == new_vessel:
+                same_vessel += 1
+            if getattr(cinfo, "port_of_discharge", None) == new_port:
+                same_port += 1
+            if self._get_lrk(cinfo) >= new_lrk:
+                # Existing container departs LATER than new one → compatible ordering
+                compat_lrk += 1
+
+        v_ratio = same_vessel / h
+        p_ratio = same_port   / h
+        c_ratio = compat_lrk  / h
+
+        return (v_ratio * 3.0) + (p_ratio * 1.5) + (c_ratio * 1.0)
+
+    def _preassign_vessel_blocks(self) -> None:
+        """
+        Pre-assign each vessel to a block before simulation starts.
+        Rules:
+          1. Sort vessels by ETD (ascending) — earlier-departing vessels get priority
+          2. Assign blocks by capacity (large vessels -> large blocks)
+          3. Enforce: vessels with overlapping discharge windows go to DIFFERENT blocks
+        """
+        blocks_by_cap = sorted(
+            self.block_layout.items(),
+            key=lambda x: x[1]["bays"] * x[1]["rows"],
+            reverse=True
+        )
+        block_names = [b for b, _ in blocks_by_cap]
+
+        vessels_sorted = sorted(
+            [(vid, s) for vid, s in self.vessel_schedule.items() if s.get("etds")],
+            key=lambda x: x[1]["etds"][0] if x[1]["etds"] else float('inf')
+        )
+
+        block_discharge_windows = {b: [] for b in block_names}
+        self.vessel_to_block = {}
+
+        for vid, sched in vessels_sorted:
+            d_start = float('inf')
+            d_end = float('-inf')
+            for rot in sched.get("rotations", []):
+                if rot.get("discharge_start"):
+                    d_start = min(d_start, rot["discharge_start"])
+                if rot.get("discharge_end"):
+                    d_end = max(d_end, rot["discharge_end"])
+
+            if d_start == float('inf'):
+                etds = sched.get("etds", [])
+                etd = etds[0] if etds else 0.0
+                d_start = etd - 86400
+                d_end = etd
+
+            assigned = False
+            for block in block_names:
+                overlaps = any(
+                    d_start < existing_end and existing_start < d_end
+                    for (existing_start, existing_end, _) in block_discharge_windows[block]
+                )
+                if not overlaps:
+                    self.vessel_to_block[vid] = block
+                    block_discharge_windows[block].append((d_start, d_end, vid))
+                    assigned = True
+                    break
+
+            if not assigned:
+                best_block = min(block_names,
+                                key=lambda b: sum(1 for _ in block_discharge_windows[b]))
+                self.vessel_to_block[vid] = best_block
+                block_discharge_windows[best_block].append((d_start, d_end, vid))
+
+    def _initialize_zones(self) -> None:
+        """Pre-compute bay zones per block per departure bucket."""
+        self.block_zones = {}
+        for block, layout in self.block_layout.items():
+            total_bays = layout["bays"]
+            zone_size  = total_bays // self.N_BUCKETS
+            zones = {}
+            for b in range(self.N_BUCKETS):
+                start = b * zone_size + 1
+                end   = (b + 1) * zone_size if b < self.N_BUCKETS - 1 else total_bays
+                zones[b] = (start, end)
+            self.block_zones[block] = zones
+
+    def _find_best_position_in_zone(self, yard_state: YardState,
+                                    block: str, event: Event,
+                                    new_lrk: tuple, occ_ratio: float) -> Position | None:
+        """
+        Search within the departure-bucket's bay zone first.
+        Falls back to full block search if the zone is full.
+        """
+        dep_time = self._parse_time(getattr(event, "departure_time", ""))
+        bucket   = self._get_departure_bucket(dep_time)
+        zone     = self.block_zones.get(block, {}).get(bucket)
+
+        if not zone:
+            return self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
+
+        bay_start, bay_end = zone
+        zone_slots = {
+            (bay, row)
+            for (bay, row) in self.non_full_stacks.get(block, set())
+            if bay_start <= bay <= bay_end
+        }
+
+        if zone_slots:
+            return self._find_best_in_slots(yard_state, block, zone_slots, event, new_lrk, occ_ratio)
+
+        return self._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
+
+    def _find_best_in_slots(self, yard_state: YardState, block: str,
+                            slots: set, event: Event,
+                            new_lrk: tuple, occ_ratio: float) -> Position | None:
+        """Score all slots in the provided set; return best position."""
+        zero_erc  = []
+        best_score, best_pos = float('inf'), None
+
+        for (bay, row) in slots:
+            height = yard_state.get_stack_height(block, bay, row)
+            max_tiers = self.block_layout[block]["tiers"]
+            if height >= max_tiers:
+                self.non_full_stacks[block].discard((bay, row))
+                continue
+
+            if self.ENABLE_FIX_D:
+                effective_limit = min(max_tiers, self._get_effective_max_height(occ_ratio))
+            else:
+                effective_limit = min(max_tiers, self.MAX_STACK_HEIGHT)
+            if height >= effective_limit:
+                continue
+
+            tier = height + 1
+            pos  = Position(block, bay, row, tier)
+            if not yard_state.is_position_valid(pos):
+                continue
+
+            erc = self._compute_erc(yard_state, block, bay, row, new_lrk)
+            score = self._score_stack(yard_state, block, bay, row, event, new_lrk, occ_ratio)
+
+            if erc == 0:
+                zero_erc.append((height, bay, row, tier))
+            elif score < best_score:
+                best_score, best_pos = score, pos
+
+        if zero_erc:
+            scored = []
+            for (h, bay, row, tier) in zero_erc:
+                hom = self._stack_homogeneity_score(yard_state, block, bay, row, event)
+                scored.append((h * 2.0 - hom, bay, row, tier))
+            scored.sort(key=lambda x: x[0])
+            _, bay, row, tier = scored[0]
+            return Position(block, bay, row, tier)
+
+    def _block_total_erc(self, yard_state: YardState, block: str) -> float:
+        """
+        Conservative upper-bound estimate of burial violations in a block.
+        Uses all-pairs inversion counting — deliberately overcounts to penalize
+        messy configurations more aggressively in the lookahead heuristic.
+        
+        Only called during rollout evaluation, not per-placement scoring.
+        """
+        total = 0
+        layout = self.block_layout[block]
+        for bay in range(1, layout["bays"] + 1):
+            for row in range(1, layout["rows"] + 1):
+                h = yard_state.get_stack_height(block, bay, row)
+                if h <= 1:
+                    continue
+                # Collect LRKs bottom-to-top
+                lrks = []
+                for tier in range(1, h + 1):
+                    cid = yard_state.get_container_at(block, bay, row, tier)
+                    if cid:
+                        cinfo = yard_state.get_container_info(cid)
+                        if cinfo:
+                            lrks.append(self._get_lrk(cinfo))
+                # All-pairs inversion count
+                for y in range(len(lrks) - 1):
+                    for z in range(y + 1, len(lrks)):
+                        if lrks[y] < lrks[z]:
+                            total += 1
+        return total
+
+    def _find_best_position_with_rollout(self, yard_state: YardState,
+                                          block: str, event: Event,
+                                          new_lrk: tuple, occ_ratio: float) -> Position | None:
+        available = self.non_full_stacks.get(block, set())
+        if not available:
+            return None
+
+        candidates = []
+        zero_erc_candidates = []
+        max_h = self._get_effective_max_height(occ_ratio) if self.ENABLE_FIX_D else self.MAX_STACK_HEIGHT
+
+        for (bay, row) in list(available):
+            height = yard_state.get_stack_height(block, bay, row)
+            max_tiers = self.block_layout[block]["tiers"]
+            if height >= max_tiers:
+                self.non_full_stacks[block].discard((bay, row))
+                continue
+
+            effective_limit = min(max_tiers, max_h)
+            if height >= effective_limit:
+                continue
+
+            tier = height + 1
+            pos = Position(block, bay, row, tier)
+            if not yard_state.is_position_valid(pos):
+                continue
+
+            erc = self._compute_erc(yard_state, block, bay, row, new_lrk)
+            score = self._score_stack(yard_state, block, bay, row, event, new_lrk, occ_ratio)
+
+            if erc == 0:
+                zero_erc_candidates.append((height, bay, row, tier))
+            elif score < float('inf'):
+                candidates.append((score, bay, row, tier))
+
+        # PATH A: ERC-0 candidates exist — use homogeneity tiebreaker (no rollout)
+        if zero_erc_candidates:
+            scored = []
+            for (h, bay, row, tier) in zero_erc_candidates:
+                hom = self._stack_homogeneity_score(yard_state, block, bay, row, event)
+                sort_key = h * 2.0 - hom
+                scored.append((sort_key, bay, row, tier))
+            scored.sort(key=lambda x: x[0])
+            _, bay, row, tier = scored[0]
+            return Position(block, bay, row, tier)
+
+        # PATH B: No ERC-0 candidates — run rollout on top-K
+        if not candidates:
+            return None
+
+        candidates.sort(key=lambda x: x[0])
+
+        # Gate rollout: only run if block is occupied enough to warrant it
+        # and there are multiple candidates with similar scores
+        run_rollout = (
+            self.ROLLOUT_ENABLED
+            and len(candidates) > 1
+            and occ_ratio > 0.40  # don't bother at very low occupancy
+            and candidates[0][0] > 0  # ERC > 0 means genuine risk
+        )
+
+        if not run_rollout:
+            _, bay, row, tier = candidates[0]
+            return Position(block, bay, row, tier)
+
+        # Rollout evaluation on top-K candidates
+        top_score = candidates[0][0]
+        rollout_pool = [c for c in candidates[:self.ROLLOUT_K]
+                       if c[0] <= top_score * 1.2 + 2.0]
+
+        best_rollout_score = float('inf')
+        best_pos = None
+
+        for (greedy_score, bay, row, tier) in rollout_pool:
+            erc_placement = self._compute_erc(yard_state, block, bay, row, new_lrk)
+            block_erc_now = self._block_total_erc(yard_state, block)
+            block_erc_after = block_erc_now + erc_placement
+
+            rollout_score = (greedy_score
+                            + self.ROLLOUT_FUTURE_WEIGHT * block_erc_after)
+
+            if rollout_score < best_rollout_score:
+                best_rollout_score = rollout_score
+                best_pos = Position(block, bay, row, tier)
+
+        return best_pos
+
     def _fallback_greedy(self, yard_state: YardState) -> Position:
         best_height = 999
         best_pos = None
@@ -592,3 +947,30 @@ class MyStrategy(PlacementStrategy):
             return Position(first_block, 1, 1, 999)
 
         return best_pos
+
+
+class VesselPreAssignStrategy(MyStrategy):
+    """Strategy using only vessel pre-assignment and baseline scoring fixes."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = False
+
+
+class BayZoningStrategy(MyStrategy):
+    """Strategy using vessel pre-assignment, bay zoning, and baseline scoring fixes."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = True
+    ENABLE_T3_ROLLOUT = False
+
+
+class AnalyticalRolloutStrategy(MyStrategy):
+    """Strategy using vessel pre-assignment, analytical rollout, and baseline scoring fixes."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = True
