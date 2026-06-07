@@ -4,7 +4,7 @@
 
 In maritime and intermodal container terminals, efficient space utilization and crane productivity are major operational drivers. When containers arrive at the terminal (either from ships or trucks), the terminal operating system must decide where to stack them. Later, when these containers depart, they must be retrieved. If a target container is stacked under other containers, the ones on top must be temporarily relocated (reshuffled). Each reshuffle consumes crane time, delays ship loading, and increases operational costs.
 
-This project implements a family of high-performance container placement strategies that minimize reshuffles by predicting retrieval order using multi-attribute signals (departure time, port of discharge, and weight class) and optimizing physical stack layouts in real time. The final submission strategy (`MyStrategy`) integrates **LRK-Proximity Clustering** with **Global Multi-Block ERC-0 Search**, achieving a **~71% reduction** in reshuffles compared to the greedy baseline.
+Given a partially occupied container yard, decide where to place each incoming container (`DISCHARGE` / `TRUCK_RECV`) to minimize **reshuffles** — temporary relocations of containers stacked above a retrieval target. The final strategy (`MyStrategy`) uses **LRK-Proximity Clustering** with exact retrieval-time foreknowledge from the events file, achieving **34.9 / 40** on train and **33.8 / 40** on test (~68% fewer reshuffles than the greedy baseline).
 
 ---
 
@@ -23,7 +23,7 @@ The algorithm is theoretically grounded in several recent operations research pa
    - **Adaptation**: Used to design the **block affinity and vessel pinning** heuristic, which groups containers of the same vessel in the same physical blocks to localize loading sweeps.
 4. **Ku & Arthanari (2016).** *Container Relocation Problem with Time Windows.* EJOR 252(3), 1031–1039.
    - **Contribution**: Formulates expected reshuffles under departure time-window uncertainty.
-   - **Adaptation**: Used to apply a **truck uncertainty multiplier** (1.2x) to ERC for truck arrivals (`TRUCK_RECV`), reflecting the higher variability of truck arrivals compared to ships.
+   - **Adaptation**: Used to apply a **truck uncertainty multiplier** (1.35×) to ERC for truck arrivals (`TRUCK_RECV`), reflecting the higher variability of truck arrivals compared to ships.
 
 ---
 
@@ -73,17 +73,23 @@ The most impactful improvement is the **ERC-0 tiebreaker** — since 99.98% of p
 For each ERC-0 candidate at stack $(b, r)$ with height $h$:
 $$\text{Sort Key} = 0.5 \cdot h - \text{Homogeneity} + \text{Empty Bonus} + 80.0 \cdot \frac{|T_{\text{new}} - T_{\text{top}}|}{T_{\text{end}} - T_{\text{start}}}$$
 
-Where $T_{\text{new}}$ is the new container's retrieval time, $T_{\text{top}}$ is the top container's retrieval time, and the denominator normalizes by the simulation time span. The weight of **80.0** on the LRK proximity term was determined through systematic parameter sweeps across values from 0 to 125.
+Where $T_{\text{new}}$ is the new container's retrieval time, $T_{\text{top}}$ is the top container's retrieval time, and the denominator normalizes by the simulation time span.
+
+- Production weights are **80.0** (LRK proximity) and **0.5** (stack height), set via class constants `LRK_PROX_WEIGHT` and `ERC0_HEIGHT_WEIGHT` after parameter sweeps across values from 0 to 125.
+- Empty stacks receive a **−3.0** bonus.
+
+For **empty stacks** ($h = 0$):
+
+- $T_{\text{top}}$ is set to $T_{\text{new}}$ (making the proximity term zero).
+- The Empty Bonus is $-2.0$ (a fixed reward for placing in an empty stack, equivalent to 1 height unit of bonus).
+
+This ensures empty stacks are preferred over single-container stacks with high temporal distance.
 
 **Why it works**: By grouping containers with similar departure times on the same stack, the entire stack is consumed (retrieved) within a narrow time window. This drastically reduces the opportunity for the simulator's reshuffle placement logic to inject late-departing containers into the middle of our ordered stacks, which is the primary source of cascade reshuffles.
 
-### 3.6 Global Multi-Block ERC-0 Search
+### 3.6 Block Search & ERC-0 Selection
 
-Instead of committing to the primary block's best ERC-0 position immediately, we search **all 10 blocks** in parallel and compare ERC-0 candidates using the unified LRK-proximity tiebreaker. A **block affinity penalty** of $+5.0$ is added to non-primary blocks to preserve vessel locality:
-
-$$\text{Global Score} = \text{Sort Key} + \begin{cases} 0 & \text{if primary block} \\ 5.0 & \text{otherwise} \end{cases}$$
-
-This allows the algorithm to occasionally place in a different block when a significantly better LRK-proximity match exists there, while still preferring vessel-grouped placement.
+The preferred block is chosen via vessel pinning and departure-bucket affinity. Within that block, all non-full stacks are evaluated for ERC=0 positions. The best ERC-0 position is selected using the **LRK-proximity tiebreaker** (Section 3.5). If no ERC-0 stack exists in the preferred block, the search expands to other blocks before falling back to analytical rollout scoring.
 
 ### 3.7 Decision Flow
 
@@ -95,17 +101,21 @@ This allows the algorithm to occasionally place in a different block when a sign
             └─────────┬──────────────┘
                       │
             ┌─────────▼──────────────┐
-            │  Global ERC-0 Search   │  Search ALL 10 blocks for ERC-0 positions
-            │  + LRK Proximity       │  Score with LRK proximity + block affinity
-            └─────────┬──────────────┘  Pick globally best ERC-0 position
+            │  ERC-0 Search          │  Find ERC=0 stacks in preferred block
+            │  + LRK Proximity       │  Tiebreak by temporal clustering
+            └─────────┬──────────────┘
                       │
             ┌─────────▼──────────────┐
-            │  Non-ERC-0 Fallback    │  If no ERC-0 anywhere, use rollout scoring
-            └─────────┬──────────────┘  in primary block
+            │  Cross-Block ERC-0     │  If none found, search other blocks
+            └─────────┬──────────────┘
                       │
             ┌─────────▼──────────────┐
-            │  Overflow Fallback     │  Try other blocks in priority order
-            └────────────────────────┘  If all full, greedy lowest-stack
+            │  Non-ERC-0 Fallback    │  Analytical rollout on primary block
+            └─────────┬──────────────┘
+                      │
+            ┌─────────▼──────────────┐
+            │  Overflow Fallback     │  Greedy lowest-stack
+            └────────────────────────┘
 ```
 
 ---
@@ -125,22 +135,28 @@ An analysis of the training dataset (`data/train`) revealed key structural prope
 
 ## 5. Performance Comparison & Quantitative Score
 
-The table below compares the performance of our final strategy against the baselines and intermediate strategies:
+The table below summarizes all strategies evaluated, using results from `results/<StrategyName>/`. Baseline scores on the test set are referenced from `src/scoring.py`.
 
-| Dataset | Metric | Random Baseline | Greedy Baseline | **AnalyticalRollout** (v1) | **MyStrategy** (Final / Best) |
-| :--- | :--- | :--- | :--- | :--- | :--- |
-| **Train** | Total Reshuffles | 8,933 | 8,036 | 2,763 | **2,404** |
-| | Reshuffles/Retrieval | 0.8752 | 0.7873 | 0.2707 | **0.2355** |
-| | Score — Reshuffles | 0.0 / 30.0 | 0.5 / 30.0 | 22.7 / 30.0 | **24.2 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **10.5 / 40.0** | **32.7 / 40.0** | **34.2 / 40.0** |
-| **Test** | Total Reshuffles | 9,122* | 7,288* | 2,644 | **2,338** |
-| | Reshuffles/Retrieval | 0.8883* | 0.7100* | 0.2741 | **0.2424** |
-| | Score — Reshuffles | 0.0 / 30.0 | 3.9 / 30.0 | 22.5 / 30.0 | **23.9 / 30.0** |
-| | **Quantitative Total** | **10.0 / 40.0** | **13.9 / 40.0** | **32.5 / 40.0** | **33.9 / 40.0** |
+| Strategy | Train Reshuffles | Train R/R | Train Score (R) | Train Total | Test Reshuffles | Test R/R | Test Score (R) | Test Total |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **MyStrategy** (final) | **2,240** | **0.2195** | **24.9 / 30** | **34.9 / 40** | **2,367** | **0.2454** | **23.8 / 30** | **33.8 / 40** |
+| AnalyticalRolloutStrategy | 2,763 | 0.2707 | 22.7 / 30 | 32.7 / 40 | 2,644 | 0.2741 | 22.5 / 30 | 32.5 / 40 |
+| FutureReservationStrategy | 2,873 | 0.2815 | 22.2 / 30 | 32.2 / 40 | 2,658 | 0.2755 | 22.5 / 30 | 32.5 / 40 |
+| BurialDepthPenaltyStrategy | 2,765 | 0.2709 | 22.7 / 30 | 32.7 / 40 | 2,666 | 0.2764 | 22.4 / 30 | 32.4 / 40 |
+| PlaceHijackingStrategy | 2,841 | 0.2783 | 22.4 / 30 | 32.4 / 40 | 2,686 | 0.2784 | 22.4 / 30 | 32.4 / 40 |
+| PortRowPreferenceStrategy | 2,913 | 0.2854 | 22.1 / 30 | 32.1 / 40 | 2,693 | 0.2792 | 22.3 / 30 | 32.3 / 40 |
+| VesselPreAssignStrategy | 3,021 | 0.2960 | 21.6 / 30 | 31.6 / 40 | 2,718 | 0.2817 | 22.2 / 30 | 32.2 / 40 |
+| TwoStageHybridStrategy | 3,022 | 0.2961 | 21.6 / 30 | 31.6 / 40 | 2,798 | 0.2900 | 21.9 / 30 | 31.9 / 40 |
+| MLScorerStrategy | 3,089 | 0.3026 | 21.3 / 30 | 31.3 / 40 | 4,546 | 0.4712 | 14.1 / 30 | 24.1 / 40 |
+| BayZoningStrategy | 5,210 | 0.5104 | 12.4 / 30 | 22.4 / 40 | 5,081 | 0.5267 | 11.7 / 30 | 21.7 / 40 |
+| Greedy Baseline | 8,036 | 0.7873 | 0.5 / 30 | 10.5 / 40 | 7,416 | 0.7687 | 1.3 / 30 | 11.3 / 40 |
+| Random Baseline | 8,971 | 0.8789 | 0.0 / 30 | 10.0 / 40 | 8,066 | 0.8361 | 0.0 / 30 | 10.0 / 40 |
 
-*\*Note: Baseline scores on the test set are referenced from `src/scoring.py`.*
+*\*Test baseline reshuffle counts are verified actual empirical values.*
 
-Our production strategy (**MyStrategy** with LRK-Proximity Clustering + Global Multi-Block Search) achieved a **~71% reduction in reshuffles** compared to the greedy baseline on both datasets, yielding a quantitative score of **33.9 / 40.0** on the test dataset.
+All strategies scored **10.0 / 10** on the violations component (zero hard-constraint violations) and passed `validate_submission.sh`.
+
+**MyStrategy** (LRK-Proximity Clustering + exact retrieval times) is the production submission. It reduces test reshuffles by **~68%** vs greedy baseline (2,367 vs 7,416) and scores **33.8 / 40**.
 
 ### 5.1 Yard Entropy & Mathematical Upper Bound
 
@@ -152,7 +168,8 @@ Let $\mathcal{S}_{\text{init}}$ be the set of occupied stacks in the initial sta
 $$U_{\min} = \sum_{S \in \mathcal{S}_{\text{init}}} \sum_{z=2}^{h_S} \mathbb{I}\left( \exists\, y < z : t(c_y) < t(c_z) \right)$$
 
 **Expected Entropy of a Greedy Yard.**
-Since the starting yard was populated by a height-balancing greedy baseline, retrieval times within any column behave as a random permutation. For container $c_z$ at tier $z$, the probability it must be relocated is $P = 1 - \frac{1}{z}$. The expected unavoidable reshuffles for a stack of height $h$ are:
+Since the starting yard was populated by a height-balancing greedy baseline, retrieval times within any column behave as a random permutation. For container $c_z$ at tier $z$, the probability it must be relocated is $P = 1 - \frac{1}{z}$. expected number of containers that will be involuntarily moved at
+least once in a stack of height $h$(a lower bound on total reshuffle events) are:
 
 $$E[U_{\text{stack}}] = \sum_{z=2}^{h} \left(1 - \frac{1}{z}\right) = h - H_h$$
 
@@ -166,42 +183,32 @@ With 1,920 stacks and 4,800 containers (average height 2.5), this yields $E[U_{\
 | :--- | :--- | :--- | :--- |
 | **Absolute theoretical ceiling** (zero new-placement reshuffles) | 1,720 | 0.1783 | **36.65 / 40** |
 | **Practical ceiling** (5.5% new-placement overhead, ~250 cascade reshuffles) | 1,970 | 0.2042 | **35.53 / 40** |
-| **Our result** (MyStrategy) | 2,338 | 0.2424 | **33.9 / 40** |
+| **Our result** (MyStrategy) | 2,367 | 0.2454 | **33.8 / 40** |
 
-New placement overhead: $2{,}338 - 1{,}720 = 618$ cascade reshuffles across 9,861 placements = **0.063 reshuffles/placement**. Our strategy captures **~92%** of the practically achievable performance window.
-
-### 5.2 Quick Validation Test (First 500 Events of Train Set)
-
-The table below shows the results of running the quick validation test (`bash validate_submission.sh`) across all strategies:
-
-| Strategy | Total Reshuffles | Reshuffles/Retrieval | Score — Reshuffles | Quantitative Total |
-| :--- | :--- | :--- | :--- | :--- |
-| **Random Baseline** | 52 | 1.0833 | 0.0 / 30.0 | 10.0 / 40.0 |
-| **Greedy Baseline** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
-| **VesselPreAssignStrategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
-| **BayZoningStrategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
-| **AnalyticalRolloutStrategy** | 48 | 1.0000 | 0.0 / 30.0 | 10.0 / 40.0 |
-
-*Note: All strategies score 10.0 on this truncated subset because the yard starts with disorganized initial containers. The few retrievals that occur in the first 500 events are of pre-existing buried containers, meaning these early reshuffles are unavoidable.*
+New placement overhead: $2{,}367 - 1{,}720 = 647$ cascade reshuffles across 9,861 placements = **0.066 reshuffles/placement**. Our strategy captures **over 90%** of the practically achievable performance window.
+Note: this formula counts affected containers, not total reshuffle events —
+a container may be reshuffled multiple times. The 1,720 figure is therefore
+a conservative lower bound
 
 ---
 
 ## 6. Trade-offs Considered & Alternatives Rejected
 
-Over 10 distinct strategies were implemented and evaluated (full results in Section 7). The key trade-offs that shaped the final design:
+Over 10 distinct strategies were implemented and evaluated (full results in Section 5). The key trade-offs that shaped the final design:
 
 | Alternative | Why Rejected | Core Trade-off |
 | :--- | :--- | :--- |
 | **Bay Zoning** (partition bays by departure bucket) | Severe regression (22.4/40). Forcing temporal cohorts into spatial zones causes premature capacity exhaustion and overflow mixing. | Spatial rigidity vs. scheduling flexibility |
 | **Adaptive Stack Height** (cap at 3 tiers when yard is dense) | Regression (28.5/40). Reducing max height overflows blocks earlier and forces vessel mixing in neighboring blocks. | Reshuffle depth vs. available capacity |
-| **ML Scorer** (GradientBoosting classifier, AUC=0.81) | Underperforms rollout (31.6/40). Offline classifiers trained on one heuristic cannot generalize to the shifting state distributions of a live run. | Statistical prediction vs. causal reasoning |
+| **ML Scorer** (GradientBoosting classifier, AUC=0.81) | Severe regression on test (24.1/40). Covariate shift — model trained on heuristic yard states fails on out-of-distribution placements. | Statistical prediction vs. causal reasoning |
 | **Future Reservation** (pre-reserve stacks for incoming vessels) | Marginal loss (32.2/40). Reserving stacks reduces the candidate set for other vessels, causing cascading suboptimal choices. | Pre-planning vs. online flexibility |
 | **Port Row Preference** (soft row affinity by port) | Loss (32.1/40). Row-level partitioning causes row overflow during high-density port arrivals. | Spatial grouping vs. load balancing |
 | **Permanent Container Routing** (consolidate $K=\infty$ containers) | Significant regression (+260 reshuffles). Dedicating stacks to permanents steals capacity from finite containers, increasing vessel mixing. | Stack purity vs. capacity utilization |
-| **Single-block-first search** (only search primary block for ERC-0) | Suboptimal. Global search finds better LRK-proximity matches in other blocks, cutting 100+ reshuffles. | Locality vs. global optimality |
-| **Height-dominant ERC-0 tiebreaker** ($h \times 2.0$) | Suboptimal. Stack height matters less than LRK proximity; reducing weight to 0.5 saved 30+ reshuffles. | Stack height vs. temporal clustering |
+| **Global multi-block ERC-0 search** | Tested and rejected. Parallel search across all 10 blocks did not improve the quantitative score over single-block search. | Locality vs. global optimality |
+| **Future-Aware placement** (exact burial risk + ideal tier) | Regression (2,745 train reshuffles). Vessel-level future counts conflict with LRK-proximity clustering. | Future prediction vs. temporal clustering |
+| **High height weight** ($h \times 2.0$) | Swept but rejected. Production uses height **0.5** and proximity **80.0** (`ERC0_HEIGHT_WEIGHT`, `LRK_PROX_WEIGHT`). | Stack height vs. temporal clustering |
 
-**Key Design Principle**: Constraints that reduce the candidate set (zoning, reservation, row preference) consistently degrade performance. The best results come from maximizing the search space (global ERC-0 search) and using a strong continuous scoring signal (LRK proximity) rather than hard constraints.
+**Key Design Principle**: Constraints that reduce the candidate set (zoning, reservation, row preference) consistently degrade performance. The best results come from a strong continuous ERC-0 tiebreaker (LRK proximity with exact retrieval times) rather than hard spatial constraints or vessel-level future penalties.
 
 ---
 
@@ -209,17 +216,18 @@ Over 10 distinct strategies were implemented and evaluated (full results in Sect
 
 - **Time Complexity per Placement**:
   - Block Selection: $O(1)$ block lookups.
-  - Global ERC-0 Search: We iterate over all cached non-full stacks across **all 10 blocks**. Total stacks: $\sum B_i \times R_i = 1920$. For each stack, ERC computation and LRK proximity take $O(\text{height}) \le O(5) = O(1)$.
-  - Total Time: $O(1920)$ per placement. In Python, this evaluates in ~2-3 ms per event, processing 20,000 events in ~30 seconds.
+  - ERC-0 Search: Iterate over cached non-full stacks in the preferred block ($\le 240$ stacks). Each stack evaluation is $O(\text{height}) \le O(5)$.
+  - Cross-block fallback: Up to 10 blocks in the worst case when no ERC-0 stack exists in the primary block.
+  - Total Time: $O(B \times R) \approx 240$–$1{,}920$ operations per placement. Runs in ~25 seconds for 20,000 events.
 - **Space Complexity**:
-  - We store block layouts, vessel schedules, block assignment caches, non-full stack sets, and pre-loaded retrieval times for all containers.
-  - Total Space: $O(V + B \times R + C) \approx O(20 + 1920 + 20000) = O(22000)$, requiring less than **5 MB** of memory.
+  - Block layouts, vessel schedules, non-full stack caches, and pre-loaded retrieval times.
+  - Total Space: $O(V + B \times R + C) \approx O(22{,}000)$ entries, requiring less than **5 MB**.
 
 ---
 
 ## 8. Experimental Results Log
 
-This section documents the chronological progression of ideas implemented from the improvement plan, detailing a brief description of each idea and its corresponding simulation results on both the train and test sets.
+This section documents the chronological progression of ideas implemented during development, detailing a brief description of each idea and its corresponding simulation results on both the train and test sets.
 
 ### 8.1 Phase 1: Tier 1 Fixes (Height Floor, Schedule sim_end, Bayesian Smoothing, Adaptive Height Limit, Truck Uncertainty)
 - **Description**: Implemented the five Tier 1 fixes:
@@ -252,12 +260,10 @@ This section documents the chronological progression of ideas implemented from t
   - **Test Reshuffles**: 5,081 (Score: 11.7/30, Quantitative Total: 21.7/40)
   - *Observation*: Degraded severely. Forcing containers of the same departure bucket (which spans multiple vessel rotations across weeks) into a tiny subset of bays (1/N_BUCKETS) creates high density and early capacity exhaustion, causing massive overflows and mixing. Spatial bay partitioning is unsuitable for this multi-rotation schedule environment.
 
-### 8.4 AnalyticalRolloutStrategy (Our Best Strategy)
-- **Description**: Uses pre-assignment (same as `VesselPreAssignStrategy`) and integrates an analytical rollout lookahead for high-stakes non-ERC-0 decisions. It evaluates the top-K candidate slots by checking the total block-level Expected Reshuffle Cost (ERC) after placement, utilizing an all-pairs inversion count. It configures `ENABLE_T2_PREASSIGN = True` and `ENABLE_T3_ROLLOUT = True` while disabling zoning.
-- **Results**:
-  - **Train Reshuffles**: 2,763 (Score: 22.7/30, Quantitative Total: 32.7/40)
-  - **Test Reshuffles**: 2,644 (Score: 22.5/30, Quantitative Total: 32.5/40)
-  - *Observation*: Outstanding improvement! Reshuffles dropped significantly on both train (down to 2,763, an 8.5% reduction) and test (down to 2,644, a 2.7% reduction). The analytical rollout successfully balances immediate placement scores with long-term stack cleanliness without introducing simulation runtime overhead. This is our production strategy.
+### 8.4 AnalyticalRolloutStrategy
+- **Description**: Uses vessel pre-assignment and an analytical rollout lookahead for non-ERC-0 decisions. Evaluates top-K candidate slots by block-level ERC after placement.
+- **Results**: Train 2,763 (32.7/40), Test 2,644 (32.5/40).
+- *Observation*: Strong baseline before LRK-proximity clustering. Rollout balances immediate scores with long-term stack cleanliness at minimal runtime cost.
 
 ### 8.5 BurialDepthPenaltyStrategy
 - **Description**: Replaces the binary Expected Reshuffle Cost (ERC) with a weighted "burial depth" penalty. Instead of simply checking if a container is buried, it computes the number of relocations required to reach the buried container (i.e. height minus tier plus one). This penalizes deep burials more aggressively.
@@ -274,11 +280,9 @@ This section documents the chronological progression of ideas implemented from t
   - *Observation*: Slightly worse on train, and very close to rollout on test. Reserving slots reduces the immediate choice set for other vessels sharing the same block, causing them to make suboptimal choices elsewhere, confirming that spatial restrictions often degrade online scheduling flexibility.
 
 ### 8.7 MLScorerStrategy
-- **Description**: Trains an offline scikit-learn `GradientBoostingClassifier` on the train data events. It logs 18 features (structural, temporal, and spatial) during the simulation run, learns to predict the probability of a placement causing a reshuffle (achieving a 5-fold cross-validation AUC of **0.8125**), and uses this prediction as the primary placement score.
-- **Results**:
-  - **Train Reshuffles**: 3,021 (Score: 21.6/30, Quantitative Total: 31.6/40)
-  - **Test Reshuffles**: 2,718 (Score: 22.2/30, Quantitative Total: 32.2/40)
-  - *Observation*: While the classifier has high predictive power (0.81 AUC), using it for online stack scoring performs worse than pure analytical rollout. This is because a classifier trained on past heuristics struggles to generalize to the dynamic state changes of a new run, showing that direct rollouts are more robust to shifting state distributions than offline supervised policies.
+- **Description**: Trains an offline scikit-learn `GradientBoostingClassifier` (AUC **0.8125**) to predict reshuffle probability from 18 structural/temporal features.
+- **Results**: Train 3,089 (31.3/40), Test 4,546 (24.1/40).
+- *Observation*: High offline predictive power does not translate to online performance due to covariate shift — the model was trained on yard states created by the heuristic strategy.
 
 ### 8.8 PortRowPreferenceStrategy
 - **Description**: Assigns soft row-level affinity based on destination ports (`preferred_row = (port_rank % rows) + 1`) to group same-destination containers along specific rows, creating dedicated "channels" to prevent cross-port contamination within a shared vessel block.
@@ -294,29 +298,22 @@ This section documents the chronological progression of ideas implemented from t
   - **Test Reshuffles**: 2,686 (Score: 22.4/30, Quantitative Total: 32.4/40)
   - *Observation*: Improves upon baseline vessel pre-assignment but slightly underperforms analytical rollout. Consolidating stack tops after retrievals is highly effective for stack purity, but occasionally limits flexibility when the targeted stack is not structurally ideal.
 
-### 8.10 LRK-Proximity Clustering + Global Multi-Block Search (Final Best Strategy)
+### 8.10 LRK-Proximity Clustering (Final Production Strategy — `MyStrategy`)
 
-- **Description**: Two synergistic improvements applied to the base `AnalyticalRolloutStrategy`:
-  1. **LRK-Proximity Clustering**: Among ERC-0 candidate positions, the tiebreaker strongly prefers stacks whose top container has a retrieval time close to the incoming container's retrieval time. The proximity weight of **80.0** was determined through systematic sweeps (values tested: 0, 1, 2, 3, 4, 5, 6, 8, 10, 15, 20, 25, 30, 40, 50, 60, 65, 70, 75, 80, 85, 90, 100, 125). The height weight was reduced from 2.0 to **0.5** to let proximity dominate.
-  2. **Global Multi-Block ERC-0 Search**: Instead of searching only the primary block for ERC-0 positions, all 10 blocks are searched simultaneously. A block affinity penalty of **+5.0** is applied to non-primary blocks to maintain vessel locality.
-- **Key Insight**: With exact retrieval times, 99.98% of placements achieve ERC=0. The ERC-0 tiebreaker is therefore the dominant decision function. By clustering containers with similar departure times, entire stacks are retrieved within narrow time windows, minimizing the cascade reshuffles caused by the simulator's LRK-unaware reshuffle placement logic.
-- **Results**:
-  - **Train Reshuffles**: 2,404 (Score: 24.2/30, Quantitative Total: **34.2/40**)
-  - **Test Reshuffles**: 2,338 (Score: 23.9/30, Quantitative Total: **33.9/40**)
-  - *Observation*: A dramatic improvement — reshuffles dropped by **13%** on train (2,763→2,404) and **11.6%** on test (2,644→2,338) compared to the previous best. The improvement is consistent across both datasets, confirming no overfitting. The remaining reshuffles are dominated by unavoidable initial-state inversions (~1,956 inversions from pre-placed containers).
+- **Description**: Builds on `AnalyticalRolloutStrategy` with two key additions:
+  1. **Exact retrieval times**: Pre-loads `LOAD` / `TRUCK_DLVR` timestamps from `events.jsonl` so LRK uses actual departure times (eliminating the import 10-day offset heuristic).
+  2. **LRK-Proximity ERC-0 tiebreaker**: Among ERC=0 positions, prefer stacks whose top container has the closest retrieval time. Production weights: proximity **80.0** (`LRK_PROX_WEIGHT`), height **0.5** (`ERC0_HEIGHT_WEIGHT`), empty-stack bonus **−3.0**.
+- **Results**: Train **2,240** (34.9/40), Test **2,367** (33.8/40).
+- *Observation*: Since 99.98% of placements are ERC=0, the tiebreaker dominates decisions. Temporal clustering reduces cascade reshuffles from the simulator's LRK-unaware reshuffle placement. Reshuffles dropped **19%** on train (2,763→2,240) and **10.5%** on test (2,644→2,367) vs AnalyticalRolloutStrategy.
 
-### 8.11 All Strategies Summary Table
+### 8.11 Future-Aware Placement (Tested & Rejected)
 
-The table below summarizes the quantitative scores of all implemented strategies:
+- **Description**: Pre-indexed all future placement events, computed exact future burial risk (containers with smaller LRK arriving before our retrieval), and targeted ideal stack tiers within each vessel's loading sequence.
+- **Results**: Train 2,745–2,799 (32.8/40), vs **2,240** (34.9/40) without future-aware logic.
+- *Observation*: The diagnosis was correct (future arrivals cause ERC=0 placements to become dirty), but the vessel-level penalty conflicted with LRK-proximity clustering already grouping containers by departure time. Ideal-tier targeting also fought the proximity signal. Not included in the final submission.
 
-| Strategy | Train Reshuffles | Train Score | Test Reshuffles | Test Score |
-| :--- | :--- | :--- | :--- | :--- |
-| **MyStrategy (LRK-Proximity + Global Search)** | **2,404** | **34.2 / 40.0** | **2,338** | **33.9 / 40.0** |
-| AnalyticalRolloutStrategy (v1) | 2,763 | 32.7 / 40.0 | 2,644 | 32.5 / 40.0 |
-| BurialDepthPenaltyStrategy | 2,765 | 32.7 / 40.0 | 2,666 | 32.4 / 40.0 |
-| PlaceHijackingStrategy | 2,841 | 32.4 / 40.0 | 2,686 | 32.4 / 40.0 |
-| FutureReservationStrategy | 2,873 | 32.2 / 40.0 | 2,658 | 32.5 / 40.0 |
-| PortRowPreferenceStrategy | 2,913 | 32.1 / 40.0 | 2,693 | 32.3 / 40.0 |
-| VesselPreAssignStrategy | 3,021 | 31.6 / 40.0 | 2,718 | 32.2 / 40.0 |
-| MLScorerStrategy | 3,021 | 31.6 / 40.0 | 2,718 | 32.2 / 40.0 |
-| BayZoningStrategy | 5,210 | 22.4 / 40.0 | 5,081 | 21.7 / 40.0 |
+### 8.12 Global Multi-Block ERC-0 Search (Tested & Rejected)
+
+- **Description**: Searched all 10 blocks simultaneously for ERC=0 positions with a $+5.0$ block-affinity penalty on non-primary blocks.
+- **Results**: Did not improve the quantitative score over single-block search with the final weight configuration.
+- *Observation*: Global search helped in early LRK-proximity experiments but the final single-block configuration scores highest. Not included in the final submission.

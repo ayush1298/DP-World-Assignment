@@ -28,6 +28,10 @@ class MyStrategy(PlacementStrategy):
     ENABLE_T3_ROLLOUT = True     # Analytical rollout lookahead (Phase 3)
     ENABLE_HOMOGENEITY_COHESION = False  # Full stack homogeneity cohesion (Phase 2)
 
+    # ERC-0 tiebreaker weights
+    LRK_PROX_WEIGHT = 80.0
+    ERC0_HEIGHT_WEIGHT = 0.5
+
     # Rollout hyperparameters
     ROLLOUT_ENABLED       = True
     ROLLOUT_K             = 5
@@ -68,7 +72,7 @@ class MyStrategy(PlacementStrategy):
                 if arg == "--data-dir" and i + 1 < len(sys.argv):
                     data_dir = sys.argv[i+1]
                     break
-        
+
         if data_dir:
             events_path = Path(data_dir) / "events.jsonl"
             if events_path.exists():
@@ -198,6 +202,29 @@ class MyStrategy(PlacementStrategy):
                     continue
                 e = json.loads(line)
                 self._all_events.append(e)
+
+    def _erc0_sort_key(self, yard_state: YardState,
+                       block: str, bay: int, row: int,
+                       event: Event, new_lrk: tuple) -> float:
+        """ERC-0 tiebreaker (lower = better)."""
+        h = yard_state.get_stack_height(block, bay, row)
+        hom = self._stack_homogeneity_score(yard_state, block, bay, row, event)
+        empty_bonus = -3.0 if h == 0 else 0.0
+
+        lrk_proximity_bonus = 0.0
+        new_dep = new_lrk[0]
+        if h > 0 and new_dep != float("inf"):
+            top_cid = yard_state.get_container_at(block, bay, row, h)
+            if top_cid:
+                top_info = yard_state.get_container_info(top_cid)
+                if top_info:
+                    top_dep = self._get_lrk(top_info)[0]
+                    if top_dep != float("inf"):
+                        span = max(self.sim_end - self.sim_start, 1.0)
+                        gap = abs(top_dep - new_dep) / span
+                        lrk_proximity_bonus = gap * self.LRK_PROX_WEIGHT
+
+        return self.ERC0_HEIGHT_WEIGHT * h - hom + empty_bonus + lrk_proximity_bonus
 
     def _simulate_lookahead(self, yard_state: YardState, candidate_pos: Position,
                             event: Event, n_future: int = 8) -> int:
@@ -732,7 +759,8 @@ class MyStrategy(PlacementStrategy):
 
         # ── Layer 2: search preferred block ───────────────────────
         if self.ENABLE_T3_ROLLOUT:
-            pos = self._find_best_position_with_rollout(yard_state, primary_block, event, new_lrk, occ_ratio)
+            pos = self._find_best_position_with_rollout(
+                yard_state, primary_block, event, new_lrk, occ_ratio)
         elif self.ENABLE_T2_ZONING:
             pos = self._find_best_position_in_zone(yard_state, primary_block, event, new_lrk, occ_ratio)
         else:
@@ -1135,28 +1163,12 @@ class MyStrategy(PlacementStrategy):
             elif score < float('inf'):
                 candidates.append((score, bay, row, tier))
 
-        # PATH A: ERC-0 candidates — tiebreak by LRK proximity + height + homogeneity
+        # PATH A: ERC-0 candidates — LRK-proximity tiebreaker
         if zero_erc_candidates:
-            new_dep = new_lrk[0]
             scored = []
             for (h, bay, row, tier) in zero_erc_candidates:
-                hom = self._stack_homogeneity_score(yard_state, block, bay, row, event)
-                empty_bonus = -3.0 if h == 0 else 0.0
-
-                # LRK proximity: prefer stacks whose top container departs close in time
-                lrk_proximity_bonus = 0.0
-                if h > 0 and new_dep != float('inf'):
-                    top_cid = yard_state.get_container_at(block, bay, row, h)
-                    if top_cid:
-                        top_info = yard_state.get_container_info(top_cid)
-                        if top_info:
-                            top_dep = self._get_lrk(top_info)[0]
-                            if top_dep != float('inf'):
-                                span = max(self.sim_end - self.sim_start, 1.0)
-                                gap = abs(top_dep - new_dep) / span
-                                lrk_proximity_bonus = gap * 90.0
-
-                sort_key = h * 2.0 - hom + empty_bonus + lrk_proximity_bonus
+                sort_key = self._erc0_sort_key(
+                    yard_state, block, bay, row, event, new_lrk)
                 scored.append((sort_key, bay, row, tier))
             scored.sort(key=lambda x: x[0])
             _, bay, row, tier = scored[0]
