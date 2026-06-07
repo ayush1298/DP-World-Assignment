@@ -17,26 +17,42 @@ mkdir -p solution
 # 4. Test on train data
 python -m src.run --strategy solution.my_strategy.MyStrategy --data-dir data/train -v
 
-# 5. Run on test data and save results
-python -m src.run --strategy solution.my_strategy.MyStrategy --data-dir data/test -o results/results.json -v
+# 5. Run on train + test and save results (recommended)
+bash run_strategy.sh solution.my_strategy.MyStrategy
 
 # 6. Validate submission
 bash validate_submission.sh
 ```
 
+## Run Script
+
+`run_strategy.sh` runs a strategy on both datasets and writes results under `results/<StrategyName>/`:
+
+```bash
+bash run_strategy.sh solution.my_strategy.MyStrategy
+```
+
+1. Runs on `data/train`, saves to `results/MyStrategy/train_results.json`
+2. Runs on `data/test`, saves to `results/MyStrategy/test_results.json`
+3. Copies test output to `results/results.json` for submission validation
+
 ## Project Structure
 
 ```
 PROBLEM.md                  # Problem statement
+README.md                   # This file
+run_strategy.sh             # Run a strategy on train + test
+validate_submission.sh      # Validate submission layout and results
 
 data/
   yard_layout.json          # Yard block dimensions
+  vessel_schedule.json      # Vessel rotation schedule
   train/
     initial_state.json      # Starting yard state (day 0)
-    events.jsonl            # 20 days of events
+    events.jsonl            # Days 1–20 events
   test/
     initial_state.json      # Starting yard state (day 20)
-    events.jsonl            # 20 days of events (scored)
+    events.jsonl            # Days 21–40 events (scored)
 
 src/
   models.py                 # Data models: Position, Container, Event
@@ -50,9 +66,19 @@ src/
   run.py                    # CLI runner
   external_adapter.py       # Non-Python solver adapter
 
-solution/                   # YOUR CODE HERE
-docs/                       # YOUR DESIGN DOCUMENT HERE
-results/                    # YOUR TEST RESULTS HERE
+solution/
+  my_strategy.py            # Main placement strategy (MyStrategy)
+  analysis/                 # Diagnostic and data analysis scripts
+  experiments/              # Parameter sweeps and ML experiment artifacts
+
+docs/
+  design.md                 # Algorithm design document
+
+results/
+  results.json              # Test results (used by validate_submission.sh)
+  MyStrategy/               # Per-strategy train/test result JSON files
+
+tests/                      # Optional unit tests
 ```
 
 ## Non-Python Solvers
