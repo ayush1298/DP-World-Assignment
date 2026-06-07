@@ -573,6 +573,7 @@ class MyStrategy(PlacementStrategy):
         return best_pos
 
     def place_container(self, yard_state: YardState, event: Event) -> Position:
+        self._block_erc_cache = {}
         # ── Record placed container type ──────────────────────────
         cid = event.container_id
         if event.type == "DISCHARGE":
@@ -903,6 +904,8 @@ class MyStrategy(PlacementStrategy):
         
         Only called during rollout evaluation, not per-placement scoring.
         """
+        if hasattr(self, "_block_erc_cache") and block in self._block_erc_cache:
+            return self._block_erc_cache[block]
         total = 0
         layout = self.block_layout[block]
         for bay in range(1, layout["bays"] + 1):
@@ -923,6 +926,9 @@ class MyStrategy(PlacementStrategy):
                     for z in range(y + 1, len(lrks)):
                         if lrks[y] < lrks[z]:
                             total += 1
+        if not hasattr(self, "_block_erc_cache"):
+            self._block_erc_cache = {}
+        self._block_erc_cache[block] = total
         return total
 
     def _find_best_position_with_rollout(self, yard_state: YardState,
@@ -1230,22 +1236,64 @@ class MLScorerStrategy(MyStrategy):
         except Exception as e:
             print("Failed to load ML model in MLScorerStrategy:", e)
 
-    def _score_stack(self, yard_state: YardState, block: str, bay: int, row: int, event: Event, new_lrk: tuple, occ_ratio: float) -> float:
-        if getattr(self, "ml_model", None):
-            import numpy as np
-            feats = self._compute_features_dict(yard_state, block, bay, row, event)
-            X = np.array([[feats[f] for f in self.feature_names]])
-            p_reshuffle = self.ml_model.predict_proba(X)[0][1]
+    def _find_best_position(self, yard_state: YardState, block: str, event: Event, new_lrk: tuple, occ_ratio: float) -> Position | None:
+        available = self.non_full_stacks.get(block, set())
+        if not available:
+            return None
+        
+        if not self.ml_model:
+            return super()._find_best_position(yard_state, block, event, new_lrk, occ_ratio)
+
+        import numpy as np
+        max_tiers = self.block_layout[block]["tiers"]
+        effective_limit = min(max_tiers, self.MAX_STACK_HEIGHT)
+
+        # 1. Collect all candidates and compute features for them
+        candidates = []
+        feature_rows = []
+        for (bay, row) in list(available):
             h = yard_state.get_stack_height(block, bay, row)
-            erc = self._compute_erc(yard_state, block, bay, row, new_lrk)
-            # Blend ML probability with standard penalties
+            if h >= max_tiers:
+                self.non_full_stacks[block].discard((bay, row))
+                continue
+            if h >= effective_limit:
+                continue
+            tier = h + 1
+            pos = Position(block, bay, row, tier)
+            if not yard_state.is_position_valid(pos):
+                continue
+            
+            # Compute features for batch inference
+            feats = self._compute_features_dict(yard_state, block, bay, row, event)
+            candidates.append((h, bay, row, tier, feats))
+            feature_rows.append([feats[f] for f in self.feature_names])
+
+        if not candidates:
+            return None
+
+        # 2. Batch predict probabilities
+        X = np.array(feature_rows)
+        p_reshuffle_all = self.ml_model.predict_proba(X)[:, 1]
+
+        # 3. Score all candidates using the batch predictions
+        best_score = float('inf')
+        best_pos = None
+
+        for idx, (h, bay, row, tier, feats) in enumerate(candidates):
+            p_reshuffle = p_reshuffle_all[idx]
+            erc = feats["erc_exact"]
+            
             score = (0.7 * p_reshuffle * 100.0
                      + 0.3 * erc * 100.0
                      + 1.0 * (h ** 2) * 0.15
                      - 3.0 * feats["vessel_purity_ratio"]
                      - 1.0 * feats["lrk_compat_ratio"])
-            return score
-        return super()._score_stack(yard_state, block, bay, row, event, new_lrk, occ_ratio)
+            
+            if score < best_score:
+                best_score = score
+                best_pos = Position(block, bay, row, tier)
+
+        return best_pos
 
 
 class TwoStageHybridStrategy(MyStrategy):
@@ -1277,8 +1325,10 @@ class TwoStageHybridStrategy(MyStrategy):
 
         import numpy as np
         max_h = self._get_effective_max_height(occ_ratio)
-        candidates = []
-
+        
+        # 1. Collect all candidates and compute features
+        candidates_raw = []
+        feature_rows = []
         for (bay, row) in list(self.non_full_stacks[block]):
             h = yard_state.get_stack_height(block, bay, row)
             if h >= max_h:
@@ -1293,12 +1343,21 @@ class TwoStageHybridStrategy(MyStrategy):
                 continue  # Hard filter
 
             feats = self._compute_features_dict(yard_state, block, bay, row, event)
-            X = np.array([[feats[f] for f in self.feature_names]])
-            p_reshuffle = self.ml_model.predict_proba(X)[0][1]
-            candidates.append((p_reshuffle, erc, h, bay, row, tier))
+            candidates_raw.append((erc, h, bay, row, tier, feats))
+            feature_rows.append([feats[f] for f in self.feature_names])
 
-        if not candidates:
+        if not candidates_raw:
             return None
+
+        # 2. Batch predict probabilities
+        X = np.array(feature_rows)
+        p_reshuffle_all = self.ml_model.predict_proba(X)[:, 1]
+
+        # 3. Create candidates with their probabilities
+        candidates = []
+        for idx, (erc, h, bay, row, tier, feats) in enumerate(candidates_raw):
+            p_reshuffle = p_reshuffle_all[idx]
+            candidates.append((p_reshuffle, erc, h, bay, row, tier))
 
         # PATH A: ERC-0 candidates exist — use homogeneity/ML score tiebreaker
         zero_erc = [c for c in candidates if c[1] == 0]
@@ -1324,3 +1383,46 @@ class TwoStageHybridStrategy(MyStrategy):
                 best_pos = Position(block, bay, row, tier)
 
         return best_pos
+
+
+class PortRowPreferenceStrategy(MyStrategy):
+    """Strategy that adds a row-level preference based on port rank within a block to prevent cross-port contamination."""
+    ENABLE_FIX_A = False
+    ENABLE_FIX_D = False
+    ENABLE_T2_PREASSIGN = True
+    ENABLE_T2_ZONING = False
+    ENABLE_T3_ROLLOUT = True
+
+    def _stack_homogeneity_score(self, yard_state: YardState, block: str, bay: int, row: int, event: Event) -> float:
+        hom = super()._stack_homogeneity_score(yard_state, block, bay, row, event)
+        vid = getattr(event, "vessel_id", None)
+        port = getattr(event, "port_of_discharge", None)
+        if vid and port:
+            sched = self.vessel_schedule.get(vid, {})
+            port_rank = sched.get("port_rank", {}).get(port, 99)
+            if port_rank != 99:
+                layout = self.block_layout[block]
+                rows = layout["rows"]
+                preferred_row = (port_rank % rows) + 1
+                if row == preferred_row:
+                    hom += 3.0
+                else:
+                    hom -= 1.0
+        return hom
+
+    def _score_stack(self, yard_state: YardState, block: str, bay: int, row: int, event: Event, new_lrk: tuple, occ_ratio: float) -> float:
+        score = super()._score_stack(yard_state, block, bay, row, event, new_lrk, occ_ratio)
+        vid = getattr(event, "vessel_id", None)
+        port = getattr(event, "port_of_discharge", None)
+        if vid and port:
+            sched = self.vessel_schedule.get(vid, {})
+            port_rank = sched.get("port_rank", {}).get(port, 99)
+            if port_rank != 99:
+                layout = self.block_layout[block]
+                rows = layout["rows"]
+                preferred_row = (port_rank % rows) + 1
+                if row == preferred_row:
+                    score -= 3.0
+                else:
+                    score += 1.0
+        return score

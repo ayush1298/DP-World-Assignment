@@ -190,3 +190,43 @@ This section documents the chronological progression of ideas implemented from t
   - **Train Reshuffles**: 2,763 (Score: 22.7/30, Quantitative Total: 32.7/40)
   - **Test Reshuffles**: 2,644 (Score: 22.5/30, Quantitative Total: 32.5/40)
   - *Observation*: Outstanding improvement! Reshuffles dropped significantly on both train (down to 2,763, an 8.5% reduction) and test (down to 2,644, a 2.7% reduction). The analytical rollout successfully balances immediate placement scores with long-term stack cleanliness without introducing simulation runtime overhead. This is our production strategy.
+
+### 7.5 BurialDepthPenaltyStrategy
+- **Description**: Replaces the binary Expected Reshuffle Cost (ERC) with a weighted "burial depth" penalty. Instead of simply checking if a container is buried, it computes the number of relocations required to reach the buried container (i.e. height minus tier plus one). This penalizes deep burials more aggressively.
+- **Results**:
+  - **Train Reshuffles**: 2,765 (Score: 22.7/30, Quantitative Total: 32.7/40)
+  - **Test Reshuffles**: 2,666 (Score: 22.4/30, Quantitative Total: 32.4/40)
+  - *Observation*: Achieves performance extremely close to `AnalyticalRolloutStrategy`. Weighting by burial depth is theoretically sound but shows minimal marginal improvement because most stack heights are kept low (2-3 containers) by the baseline height penalties, reducing the occurrence of deep burials.
+
+### 7.6 FutureReservationStrategy
+- **Description**: Accesses vessel schedule foreknowledge by pre-reserving empty/homogeneous stacks in the assigned block 4–12 hours before a vessel's discharge start window. Incoming containers for other vessels are penalized (+15.0 score penalty, -15.0 homogeneity penalty) from using these reserved stacks.
+- **Results**:
+  - **Train Reshuffles**: 2,873 (Score: 22.2/30, Quantitative Total: 32.2/40)
+  - **Test Reshuffles**: 2,658 (Score: 22.5/30, Quantitative Total: 32.5/40)
+  - *Observation*: Slightly worse on train, and very close to rollout on test. Reserving slots reduces the immediate choice set for other vessels sharing the same block, causing them to make suboptimal choices elsewhere, confirming that spatial restrictions often degrade online scheduling flexibility.
+
+### 7.7 MLScorerStrategy
+- **Description**: Trains an offline scikit-learn `GradientBoostingClassifier` on the train data events. It logs 18 features (structural, temporal, and spatial) during the simulation run, learns to predict the probability of a placement causing a reshuffle (achieving a 5-fold cross-validation AUC of **0.8125**), and uses this prediction as the primary placement score.
+- **Results**:
+  - **Train Reshuffles**: 3,021 (Score: 21.6/30, Quantitative Total: 31.6/40)
+  - **Test Reshuffles**: 2,718 (Score: 22.2/30, Quantitative Total: 32.2/40)
+  - *Observation*: While the classifier has high predictive power (0.81 AUC), using it for online stack scoring performs worse than pure analytical rollout. This is because a classifier trained on past heuristics struggles to generalize to the dynamic state changes of a new run, showing that direct rollouts are more robust to shifting state distributions than offline supervised policies.
+
+### 7.8 PortRowPreferenceStrategy
+- **Description**: Assigns soft row-level affinity based on destination ports (`preferred_row = (port_rank % rows) + 1`) to group same-destination containers along specific rows, creating dedicated "channels" to prevent cross-port contamination within a shared vessel block.
+- **Results**:
+  - **Train Reshuffles**: 2,913 (Score: 22.1/30, Quantitative Total: 32.1/40)
+  - **Test Reshuffles**: 2,693 (Score: 22.3/30, Quantitative Total: 32.3/40)
+  - *Observation*: Slightly worse than rollout. Row-level partitioning restricts flexibility and leads to overflow across rows during high-density port arrivals, confirming that soft zoning preferences still introduce minor coordination inefficiencies.
+
+### 7.9 Advanced Strategies Summary Table
+
+The table below summarizes the quantitative scores of all the newly implemented advanced strategies:
+
+| Strategy | Train Reshuffles | Train Score | Test Reshuffles | Test Score |
+| :--- | :--- | :--- | :--- | :--- |
+| **AnalyticalRolloutStrategy** (Best) | **2,763** | **32.7 / 40.0** | **2,644** | **32.5 / 40.0** |
+| **BurialDepthPenaltyStrategy** | 2,765 | 32.7 / 40.0 | 2,666 | 32.4 / 40.0 |
+| **FutureReservationStrategy** | 2,873 | 32.2 / 40.0 | 2,658 | 32.5 / 40.0 |
+| **MLScorerStrategy** | 3,021 | 31.6 / 40.0 | 2,718 | 32.2 / 40.0 |
+| **PortRowPreferenceStrategy** | 2,913 | 32.1 / 40.0 | 2,693 | 32.3 / 40.0 |
